@@ -1,7 +1,7 @@
 //! Builds `core/assets/map.json`, the map baked into the app, from Natural Earth
 //! (public domain, https://www.naturalearthdata.com) 1:10m GeoJSON files:
 //!
-//!   ne_10m_land, ne_10m_lakes, ne_10m_admin_0_boundary_lines_land,
+//!   ne_10m_land, ne_10m_lakes, ne_10m_admin_0_boundary_lines_land, ne_10m_admin_0_countries,
 //!   ne_10m_rivers_lake_centerlines, ne_10m_populated_places
 //!
 //! from https://github.com/nvkelso/natural-earth-vector/tree/master/geojson
@@ -13,13 +13,14 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-/// Area kept: the map view (50.55–53.85 N, 2.3–7.5 E) with a margin.
-const LAT: (f64, f64) = (49.8, 54.6);
-const LON: (f64, f64) = (1.0, 8.8);
+/// Area kept: Europe, as far as OPERA's radars reach (Iceland to Romania) and a bit.
+const LAT: (f64, f64) = (33.0, 72.0);
+const LON: (f64, f64) = (-26.0, 45.0);
 /// Simplification tolerance in degrees (~200 m; a map pixel is ~400 m).
 const TOLERANCE: f64 = 0.002;
-/// Towns smaller than this aren't labelled.
-const MIN_POPULATION: f64 = 45_000.0;
+/// Towns smaller than this aren't labelled (the Netherlands keeps smaller ones).
+const MIN_POPULATION: f64 = 100_000.0;
+const MIN_POPULATION_NL: f64 = 45_000.0;
 
 type Ring = Vec<(f64, f64)>; // (lon, lat)
 
@@ -63,16 +64,24 @@ fn main() {
     let lakes = polygons(&load("ne_10m_lakes"));
     let borders = lines(&load("ne_10m_admin_0_boundary_lines_land"));
     let rivers = lines(&load("ne_10m_rivers_lake_centerlines"));
+    // The Netherlands' outline, to decide which radar serves a location (KNMI inside).
+    // Clipping to Europe drops the Caribbean parts.
+    let countries = load("ne_10m_admin_0_countries");
+    let nl: Vec<Value> = countries["features"].as_array().unwrap().iter().filter(|f| f["properties"]["ADM0_A3"] == "NLD").cloned().collect();
+    let netherlands = polygons(&json!({ "features": nl }));
+    assert!(!netherlands.is_empty(), "no Netherlands in ne_10m_admin_0_countries");
 
     let mut places = Vec::new();
     for f in load("ne_10m_populated_places")["features"].as_array().unwrap() {
         let p = &f["properties"];
         let (lat, lon) = (p["LATITUDE"].as_f64().unwrap_or(0.0), p["LONGITUDE"].as_f64().unwrap_or(0.0));
         let pop = p["POP_MAX"].as_f64().unwrap_or(0.0);
-        if !inside(lon, lat) || pop < MIN_POPULATION {
+        let in_nl = (50.7..=53.6).contains(&lat) && (3.3..=7.3).contains(&lon);
+        let min = if in_nl { MIN_POPULATION_NL } else { MIN_POPULATION };
+        if !inside(lon, lat) || pop < min {
             continue;
         }
-        let name = p["NAME_NL"].as_str().filter(|s| !s.is_empty()).or(p["NAME"].as_str()).unwrap_or("?");
+        let name = p["NAME_EN"].as_str().filter(|s| !s.is_empty()).or(p["NAME"].as_str()).unwrap_or("?");
         places.push(json!({ "name": name, "lat": round(lat), "lon": round(lon), "population": pop as u64 }));
     }
     // Natural Earth leaves out many Dutch towns; add them (approximate populations,
@@ -92,6 +101,7 @@ fn main() {
         "lakes": enc(&lakes),
         "borders": enc(&borders),
         "rivers": enc(&rivers),
+        "netherlands": enc(&netherlands),
         "places": places,
     });
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("map.json");

@@ -57,12 +57,14 @@ pub struct Motion {
     pub vy: Vec<f32>,
     /// Which blocks had enough rain to measure their own motion.
     pub measured: Vec<bool>,
+    /// The grid's pixel size, to turn pixels per step into km/h.
+    pixel_km: f32,
 }
 
 impl Motion {
     fn zero(grid: &Grid) -> Motion {
         let (nx, ny) = block_counts(grid);
-        Motion { nx, ny, vx: vec![0.0; nx * ny], vy: vec![0.0; nx * ny], measured: vec![false; nx * ny] }
+        Motion { nx, ny, vx: vec![0.0; nx * ny], vy: vec![0.0; nx * ny], measured: vec![false; nx * ny], pixel_km: grid.pixel_km() as f32 }
     }
 
     /// Block centre of block (bx, by) in pixel coordinates.
@@ -99,7 +101,7 @@ impl Motion {
             }
         }
         let (vx, vy) = (sx / n as f32, sy / n as f32);
-        let kmh = vx.hypot(vy) * (60 / STEP_MINUTES) as f32;
+        let kmh = vx.hypot(vy) * self.pixel_km * (60 / STEP_MINUTES) as f32;
         let towards = vx.atan2(-vy).to_degrees().rem_euclid(360.0);
         Some((kmh, towards))
     }
@@ -162,7 +164,7 @@ pub fn estimate_motion(prev: &Frame, cur: &Frame, steps: f32) -> Motion {
     let (a, b) = (match_field(cur), match_field(prev));
     let (ca, cw, ch) = downsample(&a, w, h);
     let (cb, _, _) = downsample(&b, w, h);
-    let max_px = (MAX_SPEED_KMH / 60.0 * STEP_MINUTES as f64 * steps as f64).ceil() as i32;
+    let max_px = (MAX_SPEED_KMH / 60.0 * STEP_MINUTES as f64 * steps as f64 / grid.pixel_km()).ceil() as i32;
     let cs = (max_px + COARSE as i32 - 1) / COARSE as i32;
 
     let mut m = Motion::zero(grid);
@@ -391,13 +393,15 @@ impl Nowcast {
     pub fn point(&self, lat: f64, lon: f64) -> Vec<Sample> {
         let (col, row) = self.grid.to_pixel(lat, lon);
         let mut out = Vec::new();
+        // Radii in km, in pixels of this grid (at least about one pixel).
+        let px = |km: f64| (km / self.grid.pixel_km()).max(0.75);
         for (t, f) in &self.observed {
-            out.push(self.area_sample(f, col, row, 1.5, *t, true));
+            out.push(self.area_sample(f, col, row, px(1.5), *t, true));
         }
         for (k, f) in self.forecast.iter().enumerate() {
             let minutes = (k as f64 + 1.0) * STEP_MINUTES as f64;
             // Position uncertainty grows with lead time: ~1.5 km now, ~6.5 km at 2 h.
-            let radius = 1.5 + minutes / 24.0;
+            let radius = px(1.5 + minutes / 24.0);
             out.push(self.area_sample(f, col, row, radius, self.forecast_time(k), false));
         }
         out
@@ -520,7 +524,7 @@ mod tests {
                 dbz[y * w + x] = v;
             }
         }
-        Frame { time: DateTime::from_timestamp(1_800_000_000 + minutes * 60, 0).unwrap(), grid, dbz, radars_up: vec![], radars_down: vec![] }
+        Frame { time: DateTime::from_timestamp(1_800_000_000 + minutes * 60, 0).unwrap(), grid, dbz, radars_up: vec![], radars_down: vec![], source: "test" }
     }
 
     #[test]

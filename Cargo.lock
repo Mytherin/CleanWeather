@@ -645,6 +645,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "flate2",
  "hdf5-reader",
  "serde",
  "serde_json",

@@ -1,7 +1,9 @@
 pub mod basemap;
 pub mod forecast;
+pub mod gauges;
 pub mod knmi;
 pub mod mercator;
 pub mod nowcast;
+pub mod opera;
 pub mod radar;
 pub mod service;

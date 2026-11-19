@@ -31,6 +31,7 @@ struct UrlResponse {
 }
 
 pub struct Client {
+    dataset: (&'static str, &'static str),
     agent: ureq::Agent,
     key: String,
     cache: PathBuf,
@@ -53,7 +54,13 @@ impl Client {
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("CleanWeather/", env!("CARGO_PKG_VERSION")))
             .build();
-        Client { agent, key, cache }
+        Client { agent, key, cache, dataset: (DATASET, VERSION) }
+    }
+
+    /// The same client for another KNMI dataset (e.g. the 10-minute station observations).
+    pub fn with_dataset(mut self, name: &'static str, version: &'static str) -> Client {
+        self.dataset = (name, version);
+        self
     }
 
     fn api(&self, url: &str) -> Result<ureq::Response> {
@@ -74,7 +81,9 @@ impl Client {
     /// Names of the newest `n` radar files, newest first.
     pub fn latest_files(&self, n: usize) -> Result<Vec<String>> {
         let url = format!(
-            "https://api.dataplatform.knmi.nl/open-data/v1/datasets/{DATASET}/versions/{VERSION}/files?maxKeys={n}&orderBy=created&sorting=desc"
+            "https://api.dataplatform.knmi.nl/open-data/v1/datasets/{}/versions/{}/files?maxKeys={n}&orderBy=created&sorting=desc",
+            self.dataset.0,
+            self.dataset.1
         );
         let list: FileList = self.api(&url)?.into_json().context("parsing file list")?;
         let mut names: Vec<String> = list.files.into_iter().map(|f| f.filename).collect();
@@ -94,7 +103,9 @@ impl Client {
         }
         std::fs::create_dir_all(&self.cache)?;
         let url = format!(
-            "https://api.dataplatform.knmi.nl/open-data/v1/datasets/{DATASET}/versions/{VERSION}/files/{filename}/url"
+            "https://api.dataplatform.knmi.nl/open-data/v1/datasets/{}/versions/{}/files/{filename}/url",
+            self.dataset.0,
+            self.dataset.1
         );
         let resp: UrlResponse = self.api(&url)?.into_json().context("parsing download URL")?;
         // The temporary URL is pre-signed; it must not get the Authorization header.
@@ -118,7 +129,7 @@ impl Client {
     }
 }
 
-fn prune(dir: &Path, keep: chrono::Duration) {
+pub(crate) fn prune(dir: &Path, keep: chrono::Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let cutoff = Utc::now() - keep;
     for e in entries.flatten() {

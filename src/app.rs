@@ -6,8 +6,8 @@ use chrono::{DateTime, Local, Utc};
 use cleanweather_core::forecast::{self, Forecast};
 use cleanweather_core::nowcast::{self, Field, Nowcast, Outlook, Sample, intensity_label};
 use cleanweather_core::{basemap, mercator};
-use cleanweather_core::radar::{Grid, RAIN_DBZ};
-use cleanweather_core::service::Service;
+use cleanweather_core::radar::RAIN_DBZ;
+use cleanweather_core::service::{Europe, Service};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, pos2, vec2};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -21,15 +21,23 @@ const RETRY_EVERY: Duration = Duration::from_secs(45);
 const STALE_MINUTES: i64 = 20;
 
 /// Map area shown: roughly the Netherlands plus some North Sea, where rain comes from.
-const MAP_LAT: (f64, f64) = (50.55, 53.85);
-const MAP_LON: (f64, f64) = (2.3, 7.5);
-const MAP_ZOOM: u32 = 8;
+/// Starting zoom (about the Netherlands across) and the zoom range (Europe to a city).
+const MAP_START_ZOOM: f64 = 7.0;
+const MAP_ZOOM_RANGE: (f64, f64) = (3.5, 10.0);
+
+/// The land/water image for an area somewhat larger than the map view.
+struct LandCanvas {
+    dark: bool,
+    canvas: mercator::View,
+    texture: TextureHandle,
+}
 
 /// Refresh the 7-day forecast this often (models update every few hours).
 const FORECAST_EVERY: Duration = Duration::from_secs(30 * 60);
 
 enum Command {
-    SetKey(String),
+    /// A key was saved: rebuild the radar sources with the current keys.
+    KeysChanged,
     SetLocation(f64, f64),
     Refresh,
 }
@@ -40,17 +48,28 @@ struct Shared {
     forecast: Option<Arc<Forecast>>,
     error: Option<String>,
     forecast_error: Option<String>,
+    /// Which radar the nowcast is from, and why a preferred one wasn't used.
+    source: Option<&'static str>,
+    fallback: Option<String>,
     checking: bool,
     last_check: Option<DateTime<Utc>>,
+    /// Rain across Europe (OPERA, 4 km) for the map, and which of its pixels the local
+    /// nowcast covers (shown from the local radar instead).
+    europe: Option<Arc<Nowcast>>,
+    europe_mask: Option<Arc<Vec<bool>>>,
 }
 
 pub struct App {
     shared: Arc<Mutex<Shared>>,
     commands: Sender<Command>,
     settings: Settings,
-    has_key: bool,
     key_input: String,
+    meteogate_input: String,
     show_settings: bool,
+    /// The location picker, and whether the next map click sets the location.
+    picker_open: bool,
+    picker_query: String,
+    picking_on_map: bool,
     /// Map frame shown: index into observed scans followed by forecast steps.
     frame: usize,
     playing: bool,
@@ -58,10 +77,14 @@ pub struct App {
     /// Textures per map frame, for the nowcast issued at `textures_for`.
     textures: Vec<Option<TextureHandle>>,
     textures_for: Option<(DateTime<Utc>, bool)>,
-    /// Radar grid cell under each pixel of the map image, for the grid it was made for.
-    lookup: Option<(Grid, Vec<Option<u32>>)>,
-    /// The land/water image, for dark mode or not.
-    land: Option<(bool, TextureHandle)>,
+    /// Textures of the Europe-wide frames, for (nowcast, dark mode, coverage mask).
+    europe_textures: Vec<Option<TextureHandle>>,
+    europe_textures_for: Option<(DateTime<Utc>, bool, usize)>,
+    /// The map's centre and zoom (the centre starts at the location).
+    map_centre: Option<(f64, f64)>,
+    map_zoom: f64,
+    last_zoom_input: Instant,
+    land: Option<LandCanvas>,
 }
 
 impl App {
@@ -81,24 +104,36 @@ impl App {
             shared,
             commands: tx,
             settings,
-            has_key: key.is_some(),
             key_input: String::new(),
+            meteogate_input: String::new(),
             show_settings: false,
+            // CLEANWEATHER_SEARCH opens the location picker with this text (for testing).
+            picker_open: std::env::var("CLEANWEATHER_SEARCH").is_ok(),
+            picker_query: std::env::var("CLEANWEATHER_SEARCH").unwrap_or_default(),
+            picking_on_map: false,
             frame: usize::MAX,
             playing: false,
             last_tick: Instant::now(),
             textures: Vec::new(),
             textures_for: None,
-            lookup: None,
+            europe_textures: Vec::new(),
+            europe_textures_for: None,
+            map_centre: None,
+            // CLEANWEATHER_MAP_ZOOM overrides the starting zoom (e.g. 4.5 for all of Europe).
+            map_zoom: std::env::var("CLEANWEATHER_MAP_ZOOM").ok().and_then(|z| z.parse().ok()).unwrap_or(MAP_START_ZOOM),
+            last_zoom_input: Instant::now(),
             land: None,
         }
     }
 }
 
-/// Background thread: checks KNMI for new scans and recomputes the nowcast, and keeps
-/// the 7-day forecast for the current location fresh.
+/// Background thread: checks the radar sources for new scans and recomputes the
+/// nowcast, and keeps the 7-day forecast for the current location fresh.
 fn worker(key: Option<String>, mut at: (f64, f64), rx: Receiver<Command>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
-    let mut service = key.map(|k| Service::new(k, config::cache_dir()));
+    let new_service = |knmi: Option<String>| Service::new(knmi, config::meteogate_key(), config::cache_dir());
+    let mut service = Some(new_service(key));
+    let mut europe = Europe::new(config::meteogate_key(), config::cache_dir());
+    let mut mask_for: Option<(DateTime<Utc>, cleanweather_core::radar::Grid, DateTime<Utc>)> = None;
     // When and where the forecast was last fetched.
     let mut forecast_for: Option<(Instant, (f64, f64))> = None;
     loop {
@@ -124,13 +159,15 @@ fn worker(key: Option<String>, mut at: (f64, f64), rx: Receiver<Command>, shared
         if let Some(s) = service.as_mut() {
             shared.lock().unwrap().checking = true;
             ctx.request_repaint();
-            let result = s.update();
+            let result = s.update(at.0, at.1);
             let mut sh = shared.lock().unwrap();
             sh.checking = false;
             sh.last_check = Some(Utc::now());
             match result {
-                Ok(Some(nc)) => {
-                    sh.nowcast = Some(Arc::new(nc));
+                Ok(Some(u)) => {
+                    sh.nowcast = Some(Arc::new(u.nowcast));
+                    sh.source = Some(u.source);
+                    sh.fallback = u.fallback_reason;
                     sh.error = None;
                 }
                 Ok(None) => sh.error = None,
@@ -142,14 +179,71 @@ fn worker(key: Option<String>, mut at: (f64, f64), rx: Receiver<Command>, shared
             drop(sh);
             ctx.request_repaint();
         }
+        // Rain across Europe for the map; failures here only leave the map local.
+        let europe_new = match europe.update() {
+            Ok(Some(nc)) => Some(Arc::new(nc)),
+            _ => None,
+        };
+        let (local, europe_now) = {
+            let mut sh = shared.lock().unwrap();
+            if let Some(e) = europe_new {
+                sh.europe = Some(e);
+            }
+            (sh.nowcast.clone(), sh.europe.clone())
+        };
+        // Which Europe pixels the local radar covers, when either has changed.
+        if let (Some(l), Some(e)) = (&local, &europe_now) {
+            let id = (l.issued, l.grid, e.issued);
+            if mask_for != Some(id) {
+                let mask = Arc::new(cleanweather_core::service::covered(&e.grid, l));
+                shared.lock().unwrap().europe_mask = Some(mask);
+                mask_for = Some(id);
+                ctx.request_repaint();
+            }
+        }
         match rx.recv_timeout(wait) {
-            Ok(Command::SetKey(k)) => service = Some(Service::new(k, config::cache_dir())),
+            Ok(Command::KeysChanged) => {
+                service = Some(new_service(config::api_key()));
+                europe = Europe::new(config::meteogate_key(), config::cache_dir());
+            }
             Ok(Command::SetLocation(lat, lon)) => at = (lat, lon),
             Ok(Command::Refresh) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Lowercase without accents, for matching typed place names ("dusseldorf", "zurich").
+fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        let base = match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ą' | 'ă' => "a",
+            'ç' | 'ć' | 'č' => "c",
+            'ď' => "d",
+            'è' | 'é' | 'ê' | 'ë' | 'ę' | 'ě' => "e",
+            'ğ' => "g",
+            'ì' | 'í' | 'î' | 'ï' | 'ı' => "i",
+            'ł' => "l",
+            'ñ' | 'ń' | 'ň' => "n",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ő' => "o",
+            'ř' => "r",
+            'ś' | 'š' | 'ș' | 'ş' => "s",
+            'ß' => "ss",
+            'ț' | 'ţ' | 'ť' => "t",
+            'ù' | 'ú' | 'û' | 'ü' | 'ů' | 'ű' => "u",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            '\'' | '’' => "",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        out.push_str(base);
+    }
+    out
 }
 
 fn local(t: DateTime<Utc>) -> String {
@@ -217,14 +311,23 @@ fn rate_y(mm_h: f32) -> f32 {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (nowcast, forecast, error, forecast_error, checking, last_check) = {
+        let (nowcast, forecast, error, forecast_error, checking, last_check, source, fallback, europe, europe_mask) = {
             let s = self.shared.lock().unwrap();
-            (s.nowcast.clone(), s.forecast.clone(), s.error.clone(), s.forecast_error.clone(), s.checking, s.last_check)
+            (s.nowcast.clone(), s.forecast.clone(), s.error.clone(), s.forecast_error.clone(), s.checking, s.last_check, s.source, s.fallback.clone(), s.europe.clone(), s.europe_mask.clone())
         };
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.status_bar(ui, nowcast.as_deref(), error.as_deref(), checking, last_check);
+                if let Some(src) = source.filter(|_| nowcast.is_some()) {
+                    let label = ui.label(egui::RichText::new(format!("· {src}")).small().weak());
+                    if let Some(why) = &fallback {
+                        label.on_hover_text(format!("Using {src} because {why}"));
+                    }
+                }
+                if let Some(why) = &fallback {
+                    ui.colored_label(Color32::from_rgb(0xe0, 0x8a, 0x00), "⚠ fallback").on_hover_text(why);
+                }
                 if let Some(e) = &forecast_error {
                     ui.colored_label(Color32::from_rgb(0xd0, 0x30, 0x30), e);
                 }
@@ -232,10 +335,6 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if !self.has_key {
-                self.key_prompt(ui);
-                return;
-            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.header(ui, nowcast.as_deref(), forecast.as_deref());
                 match nowcast.as_deref() {
@@ -248,7 +347,8 @@ impl eframe::App for App {
                             week(ui, f);
                         }
                         ui.add_space(16.0);
-                        self.radar_map(ui, ctx, nc);
+                        let europe = europe.as_deref().zip(europe_mask.as_ref());
+                        self.radar_map(ui, ctx, nc, source, europe);
                     }
                     None => {
                         ui.add_space(40.0);
@@ -266,6 +366,9 @@ impl eframe::App for App {
         if self.show_settings {
             self.settings_window(ctx);
         }
+        if self.picker_open {
+            self.location_picker(ctx);
+        }
 
         // Keep "minutes ago" fresh; animate when playing.
         if self.playing {
@@ -277,36 +380,39 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn key_prompt(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(40.0);
-        ui.vertical_centered(|ui| {
-            ui.heading("Connect to KNMI");
-            ui.add_space(8.0);
-            ui.label("CleanWeather reads KNMI's rain radar directly.\nPaste your Open Data API key from developer.dataplatform.knmi.nl:");
-            ui.add_space(8.0);
-            ui.add(egui::TextEdit::singleline(&mut self.key_input).desired_width(320.0).hint_text("API key"));
-            ui.add_space(8.0);
-            if ui.button("Save").clicked() && !self.key_input.trim().is_empty() {
-                self.save_key();
-            }
-        });
-    }
-
-    fn save_key(&mut self) {
-        let key = self.key_input.trim().to_string();
-        if let Err(e) = config::save_api_key(&key) {
+    /// Save a key typed in Settings (KNMI or MeteoGate) and rebuild the sources.
+    fn save_key(&mut self, meteogate: bool) {
+        let input = if meteogate { &mut self.meteogate_input } else { &mut self.key_input };
+        let key = input.trim().to_string();
+        input.clear();
+        let saved = if meteogate { config::save_meteogate_key(&key) } else { config::save_api_key(&key) };
+        if let Err(e) = saved {
             self.shared.lock().unwrap().error = Some(format!("{e:#}"));
             return;
         }
-        let _ = self.commands.send(Command::SetKey(key));
-        self.has_key = true;
-        self.key_input.clear();
+        let _ = self.commands.send(Command::KeysChanged);
     }
 
     fn header(&mut self, ui: &mut egui::Ui, nc: Option<&Nowcast>, forecast: Option<&Forecast>) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new(&self.settings.place).size(26.0).strong());
+                // The place name, with a small arrow, opens the location picker.
+                let name = ui
+                    .horizontal(|ui| {
+                        let label = ui.add(egui::Label::new(egui::RichText::new(&self.settings.place).size(26.0).strong()).sense(Sense::click()));
+                        let (r, arrow) = ui.allocate_exact_size(vec2(18.0, 26.0), Sense::click());
+                        let c = r.center() + vec2(0.0, 2.0);
+                        let color = if label.hovered() || arrow.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                        ui.painter().add(egui::Shape::convex_polygon(vec![c + vec2(-6.0, -3.0), c + vec2(6.0, -3.0), c + vec2(0.0, 4.0)], color, Stroke::NONE));
+                        label.union(arrow)
+                    })
+                    .inner
+                    .on_hover_text("Change location")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if name.clicked() {
+                    self.picker_open = !self.picker_open;
+                    self.picker_query.clear();
+                }
                 ui.label(egui::RichText::new(format!("{:.3}° N, {:.3}° E", self.settings.lat, self.settings.lon)).small().weak());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -430,7 +536,7 @@ impl App {
         v
     }
 
-    fn radar_map(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, nc: &Nowcast) {
+    fn radar_map(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, nc: &Nowcast, source: Option<&str>, europe: Option<(&Nowcast, &Arc<Vec<bool>>)>) {
         let pal = Palette::new(ui);
         let frames = Self::map_frames(nc);
         let latest = nc.observed.len() - 1;
@@ -443,65 +549,139 @@ impl App {
         }
         self.frame = self.frame.min(frames.len() - 1);
 
-        // The map and the radar reprojected onto it, in Web Mercator at zoom 8
-        // (~0.4 km per pixel; the radar itself is 1 km).
-        let view = mercator::View::around(MAP_LAT, MAP_LON, MAP_ZOOM);
-        let (rw, rh) = (view.width() as usize, view.height() as usize);
-        if self.land.as_ref().map(|l| l.0) != Some(pal.dark) {
-            let (land, water) = if pal.dark { ([44, 46, 50], [24, 28, 35]) } else { ([246, 245, 240], [212, 225, 238]) };
-            // Twice the resolution, so coastlines stay sharp on high-DPI screens.
-            let img = basemap::map().render(&view, rw * 2, rh * 2, land, water);
-            let img = egui::ColorImage::from_rgba_unmultiplied([rw * 2, rh * 2], &img);
-            self.land = Some((pal.dark, ctx.load_texture("land", img, egui::TextureOptions::LINEAR)));
-        }
-        if self.lookup.as_ref().map(|l| l.0) != Some(nc.grid) {
-            self.lookup = Some((nc.grid, view.radar_lookup(&nc.grid, rw, rh)));
-        }
+        // The radar frame, as an image of its own grid (drawn warped onto the map below).
+        // With the Europe layer underneath, areas without local data are left clear.
+        let g = nc.grid;
         let i = self.frame;
         if self.textures[i].is_none() {
             let f = frames[i].1;
-            let lookup = &self.lookup.as_ref().unwrap().1;
-            let mut rgba = Vec::with_capacity(rw * rh * 4);
-            for idx in lookup {
-                let dbz = idx.map_or(f32::NAN, |k| f.dbz(k as usize));
-                rgba.extend_from_slice(&radar_color(dbz, pal.dark).to_array());
+            let mut rgba = Vec::with_capacity(g.width * g.height * 4);
+            for k in 0..g.width * g.height {
+                let d = f.dbz(k);
+                let c = if d.is_nan() && europe.is_some() { Color32::TRANSPARENT } else { radar_color(d, pal.dark) };
+                rgba.extend_from_slice(&c.to_array());
             }
-            let img = egui::ColorImage::from_rgba_premultiplied([rw, rh], &rgba);
+            let img = egui::ColorImage::from_rgba_premultiplied([g.width, g.height], &rgba);
             self.textures[i] = Some(ctx.load_texture(format!("radar{i}"), img, egui::TextureOptions::LINEAR));
         }
 
+        // The Europe-wide frame for the same time (nearest within 5 minutes), without the
+        // pixels the local radar covers.
+        let (t_shown, _, _) = frames[i];
+        let europe_frame = europe.and_then(|(e, mask)| {
+            let ef = Self::map_frames(e);
+            let key = (e.issued, pal.dark, Arc::as_ptr(mask) as usize);
+            if self.europe_textures_for != Some(key) {
+                self.europe_textures = vec![None; ef.len()];
+                self.europe_textures_for = Some(key);
+            }
+            let j = (0..ef.len()).min_by_key(|&j| (ef[j].0 - t_shown).num_seconds().abs())?;
+            if (ef[j].0 - t_shown).num_minutes().abs() > 5 {
+                return None;
+            }
+            if self.europe_textures[j].is_none() {
+                let (eg, f) = (e.grid, ef[j].1);
+                let mut rgba = Vec::with_capacity(eg.width * eg.height * 4);
+                for k in 0..eg.width * eg.height {
+                    let c = if mask.get(k).copied().unwrap_or(false) { Color32::TRANSPARENT } else { radar_color(f.dbz(k), pal.dark) };
+                    rgba.extend_from_slice(&c.to_array());
+                }
+                let img = egui::ColorImage::from_rgba_premultiplied([eg.width, eg.height], &rgba);
+                self.europe_textures[j] = Some(ctx.load_texture(format!("europe{j}"), img, egui::TextureOptions::LINEAR));
+            }
+            Some((e.grid, self.europe_textures[j].clone().unwrap()))
+        });
+
+        // The view: one world pixel per point at the current zoom, centred on `map_centre`.
         let width = ui.available_width();
-        let size = vec2(width, width * (view.height() / view.width()) as f32);
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, if pal.dark { Color32::from_gray(28) } else { Color32::from_gray(238) });
-        let scale = rect.width() / view.width() as f32;
-        let to_screen = |x: f64, y: f64| pos2(rect.left() + (x - view.x0) as f32 * scale, rect.top() + (y - view.y0) as f32 * scale);
-        let full_uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let size = vec2(width, (width * 0.9).min(720.0));
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        let centre = *self.map_centre.get_or_insert((self.settings.lat, self.settings.lon));
+        let view = mercator::View::centred(centre.0, centre.1, self.map_zoom, rect.width() as f64, rect.height() as f64);
+        let to_screen = |x: f64, y: f64| pos2(rect.left() + (x - view.x0) as f32, rect.top() + (y - view.y0) as f32);
         let geo = |lat: f64, lon: f64| {
             let (x, y) = mercator::to_world(lat, lon, view.zoom);
             to_screen(x, y)
         };
-        let map = basemap::map();
+        let painter = ui.painter_at(rect);
+        let (land_rgb, water_rgb) = if pal.dark { ([44, 46, 50], [24, 28, 35]) } else { ([246, 245, 240], [212, 225, 238]) };
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(water_rgb[0], water_rgb[1], water_rgb[2]));
 
-        // Land and water, then rivers and borders, then the rain, then place names on top
-        // so they stay readable.
-        painter.image(self.land.as_ref().unwrap().1.id(), rect, full_uv, Color32::WHITE);
-        let (river, border) = if pal.dark {
-            (Color32::from_rgb(40, 52, 68), Color32::from_gray(95))
-        } else {
-            (Color32::from_rgb(180, 202, 226), Color32::from_gray(150))
+        // Land and water: rendered for a canvas half a view larger on every side, so
+        // panning doesn't need a new one; while zooming the old canvas is scaled until
+        // the zoom has settled.
+        let ppp = ctx.pixels_per_point().min(2.0) as f64;
+        let stale = match &self.land {
+            None => true,
+            Some(l) => l.dark != pal.dark || {
+                let k = (view.zoom - l.canvas.zoom).exp2();
+                let inside = view.x0 >= l.canvas.x0 * k && view.y0 >= l.canvas.y0 * k && view.x1 <= l.canvas.x1 * k && view.y1 <= l.canvas.y1 * k;
+                !inside || (view.zoom != l.canvas.zoom && self.last_zoom_input.elapsed() > Duration::from_millis(250))
+            },
         };
-        for line in &map.rivers {
-            painter.add(egui::Shape::line(line.iter().map(|p| geo(p[1], p[0])).collect(), Stroke::new(1.0_f32, river)));
+        if stale {
+            let (mw, mh) = (view.width() / 2.0, view.height() / 2.0);
+            let canvas = mercator::View { zoom: view.zoom, x0: view.x0 - mw, y0: view.y0 - mh, x1: view.x1 + mw, y1: view.y1 + mh };
+            let (w, h) = ((canvas.width() * ppp) as usize, (canvas.height() * ppp) as usize);
+            let img = basemap::map().render(&canvas, w, h, land_rgb, water_rgb);
+            let tex = ctx.load_texture("land", egui::ColorImage::from_rgba_unmultiplied([w, h], &img), egui::TextureOptions::LINEAR);
+            self.land = Some(LandCanvas { dark: pal.dark, canvas, texture: tex });
         }
-        for line in &map.borders {
-            painter.add(egui::Shape::dashed_line(&line.iter().map(|p| geo(p[1], p[0])).collect::<Vec<_>>(), Stroke::new(1.0_f32, border), 4.0, 3.0));
+        if let Some(l) = &self.land {
+            let k = (view.zoom - l.canvas.zoom).exp2();
+            let r = Rect::from_min_max(to_screen(l.canvas.x0 * k, l.canvas.y0 * k), to_screen(l.canvas.x1 * k, l.canvas.y1 * k));
+            painter.image(l.texture.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
-        painter.image(self.textures[i].as_ref().unwrap().id(), rect, full_uv, Color32::WHITE);
+        if view.zoom != self.land.as_ref().map_or(view.zoom, |l| l.canvas.zoom) {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
 
-        let (mx, my) = mercator::to_world(self.settings.lat, self.settings.lon, view.zoom);
-        let me = to_screen(mx, my);
+        // Rivers and borders, simplified for the zoom level.
+        let map = basemap::map();
+        let lod = map.lod(view.zoom.ceil() as u32);
+        let k = (view.zoom - lod.zoom as f64).exp2();
+        let (river, border) = if pal.dark { (Color32::from_rgb(40, 52, 68), Color32::from_gray(95)) } else { (Color32::from_rgb(180, 202, 226), Color32::from_gray(150)) };
+        let visible = |s: &&basemap::Shape| s.overlaps(view.x0 / k, view.y0 / k, view.x1 / k, view.y1 / k);
+        let pts = |s: &basemap::Shape| -> Vec<Pos2> { s.points.iter().map(|&(x, y)| to_screen(x * k, y * k)).collect() };
+        if view.zoom >= 5.0 {
+            for s in lod.rivers.iter().filter(visible) {
+                painter.add(egui::Shape::line(pts(s), Stroke::new(1.0_f32, river)));
+            }
+        }
+        for s in lod.borders.iter().filter(visible) {
+            painter.add(egui::Shape::dashed_line(&pts(s), Stroke::new(1.0_f32, border), 4.0, 3.0));
+        }
+
+        // The rain: each radar grid's image on a mesh whose vertices are grid points
+        // projected onto the map, so it lines up at any zoom whatever the radar's
+        // projection. Europe underneath, the local radar on top.
+        let grid_mesh = |g: &cleanweather_core::radar::Grid, tex: egui::TextureId, n: usize| {
+            let mut mesh = egui::epaint::Mesh::with_texture(tex);
+            for j in 0..=n {
+                for ii in 0..=n {
+                    let (u, v) = (ii as f32 / n as f32, j as f32 / n as f32);
+                    let (lat, lon) = g.to_latlon(u as f64 * g.width as f64, v as f64 * g.height as f64);
+                    mesh.vertices.push(egui::epaint::Vertex { pos: geo(lat, lon), uv: pos2(u, v), color: Color32::WHITE });
+                }
+            }
+            for j in 0..n as u32 {
+                for ii in 0..n as u32 {
+                    let a = j * (n as u32 + 1) + ii;
+                    let b = a + n as u32 + 1;
+                    mesh.add_triangle(a, a + 1, b);
+                    mesh.add_triangle(a + 1, b + 1, b);
+                }
+            }
+            egui::Shape::mesh(mesh)
+        };
+        if let Some((eg, tex)) = &europe_frame {
+            painter.add(grid_mesh(eg, tex.id(), 96));
+        }
+        if let Some(tex) = &self.textures[i] {
+            painter.add(grid_mesh(&g, tex.id(), 48));
+        }
+
+        let me = geo(self.settings.lat, self.settings.lon);
         // Labels, biggest towns first, skipping any that would overlap one already placed
         // (or the pin). More fit when the window is wider.
         let mut taken = vec![Rect::from_center_size(me, vec2(16.0, 16.0))];
@@ -543,15 +723,75 @@ impl App {
             painter.galley(r.min + vec2(5.0, 2.0), galley, pal.text);
         };
         tag(rect.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, label, 13.0);
-        tag(rect.right_bottom() - vec2(6.0, 4.0), Align2::RIGHT_BOTTOM, "Map: Natural Earth · Radar: KNMI".into(), 9.5);
+        let radar = match source {
+            Some("OPERA") => cleanweather_core::opera::ATTRIBUTION,
+            Some(s) => s,
+            None => "",
+        };
+        tag(rect.right_bottom() - vec2(6.0, 4.0), Align2::RIGHT_BOTTOM, format!("Map: Natural Earth · Radar: {radar}"), 9.5);
 
-        if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
-            let x = view.x0 + ((p.x - rect.left()) / scale) as f64;
-            let y = view.y0 + ((p.y - rect.top()) / scale) as f64;
-            let (lat, lon) = mercator::to_latlon(x, y, view.zoom);
-            self.set_location(lat, lon);
+        // Zoom buttons and "back to my location".
+        let mut zoom_to = None;
+        // In a child Ui, so placing them doesn't move the parent's layout cursor.
+        let button = |ui: &mut egui::Ui, at: Pos2, text: &str, tip: &str| {
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(at, vec2(26.0, 26.0))));
+            child.add_sized([26.0, 26.0], egui::Button::new(egui::RichText::new(text).size(15.0))).on_hover_text(tip).clicked()
+        };
+        let x = rect.right() - 34.0;
+        if button(ui, pos2(x, rect.top() + 8.0), "+", "Zoom in") {
+            zoom_to = Some((self.map_zoom + 1.0, rect.center()));
         }
-        resp.on_hover_text("Click to set your location");
+        if button(ui, pos2(x, rect.top() + 38.0), "−", "Zoom out") {
+            zoom_to = Some((self.map_zoom - 1.0, rect.center()));
+        }
+        if button(ui, pos2(x, rect.top() + 72.0), "⌖", "Back to my location") {
+            self.map_centre = Some((self.settings.lat, self.settings.lon));
+        }
+
+        // Drag to pan; pinch or Ctrl+scroll (or double-click) to zoom around the pointer;
+        // click to set the location.
+        let to_latlon = |p: Pos2, v: &mercator::View| mercator::to_latlon(v.x0 + (p.x - rect.left()) as f64, v.y0 + (p.y - rect.top()) as f64, v.zoom);
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let (cx, cy) = mercator::to_world(centre.0, centre.1, view.zoom);
+            self.map_centre = Some(mercator::to_latlon(cx - d.x as f64, cy - d.y as f64, view.zoom));
+        }
+        if resp.hovered() {
+            let factor = ui.input(|i| i.zoom_delta());
+            if factor != 1.0 {
+                zoom_to = Some((self.map_zoom + (factor as f64).log2(), ui.input(|i| i.pointer.hover_pos()).unwrap_or(rect.center())));
+            }
+        }
+        if resp.double_clicked() {
+            zoom_to = Some((self.map_zoom + 1.0, resp.interact_pointer_pos().unwrap_or(rect.center())));
+        } else if resp.clicked() && self.picking_on_map {
+            // Only in "pick on the map" mode, so exploring the map never moves the location.
+            if let Some(p) = resp.interact_pointer_pos() {
+                let (lat, lon) = to_latlon(p, &view);
+                self.set_location(lat, lon, None);
+                self.picking_on_map = false;
+            }
+        }
+        if self.picking_on_map {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.picking_on_map = false;
+            }
+            let banner = Rect::from_center_size(pos2(rect.center().x, rect.top() + 22.0), vec2(270.0, 26.0));
+            painter.rect_filled(banner, 6.0, pal.pin);
+            painter.text(banner.center(), Align2::CENTER_CENTER, "Click the map to set your location (Esc cancels)", FontId::proportional(12.0), Color32::WHITE);
+        }
+        if let Some((z, anchor)) = zoom_to {
+            // Keep the point under the anchor where it is.
+            let z = z.clamp(MAP_ZOOM_RANGE.0, MAP_ZOOM_RANGE.1);
+            let (alat, alon) = to_latlon(anchor, &view);
+            let (ax, ay) = mercator::to_world(alat, alon, z);
+            let (dx, dy) = ((anchor.x - rect.center().x) as f64, (anchor.y - rect.center().y) as f64);
+            self.map_centre = Some(mercator::to_latlon(ax - dx, ay - dy, z));
+            self.map_zoom = z;
+            self.last_zoom_input = Instant::now();
+        }
+        resp.on_hover_text(if self.picking_on_map { "Click to set your location" } else { "Drag to move · Ctrl+scroll, pinch or double-click to zoom" });
 
         // Timeline controls.
         ui.add_space(6.0);
@@ -592,16 +832,65 @@ impl App {
         }
     }
 
-    fn set_location(&mut self, lat: f64, lon: f64) {
-        self.settings.place = match basemap::map().nearest_place(lat, lon) {
+    /// Move the location (named, or named after the nearest town) and save it, so the
+    /// app opens there next time.
+    fn set_location(&mut self, lat: f64, lon: f64, name: Option<String>) {
+        self.settings.place = name.unwrap_or_else(|| match basemap::map().nearest_place(lat, lon) {
             Some((p, d)) if d < 4.0 => p.name.clone(),
             Some((p, d)) if d < 25.0 => format!("Near {}", p.name),
             _ => "Selected location".into(),
-        };
+        });
         self.settings.lat = lat;
         self.settings.lon = lon;
         let _ = self.commands.send(Command::SetLocation(lat, lon));
-        let _ = self.settings.save();
+        if let Err(e) = self.settings.save() {
+            self.shared.lock().unwrap().error = Some(format!("couldn't save the location: {e:#}"));
+        }
+    }
+
+    /// The location picker: search the towns on the map, or pick a spot on the map.
+    fn location_picker(&mut self, ctx: &egui::Context) {
+        let mut open = self.picker_open;
+        let mut chosen = None;
+        egui::Window::new("Choose location").open(&mut open).collapsible(false).resizable(false).default_width(300.0).anchor(Align2::LEFT_TOP, vec2(12.0, 70.0)).show(ctx, |ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut self.picker_query).hint_text("Search for a town or city").desired_width(f32::INFINITY));
+            if !field.has_focus() && self.picker_query.is_empty() {
+                field.request_focus();
+            }
+            let q = fold(self.picker_query.trim());
+            if !q.is_empty() {
+                // Names starting with the text first, then containing it; bigger towns first.
+                let mut hits: Vec<&basemap::Place> = basemap::map().places.iter().filter(|p| fold(&p.name).contains(&q)).collect();
+                hits.sort_by_key(|p| (!fold(&p.name).starts_with(&q), std::cmp::Reverse(p.population)));
+                ui.add_space(4.0);
+                if hits.is_empty() {
+                    ui.label(egui::RichText::new("No town by that name on the map. Try “Pick on the map”.").weak());
+                }
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                for (k, p) in hits.iter().take(10).enumerate() {
+                    let label = format!("{}   {:.2}° N, {:.2}° E", p.name, p.lat, p.lon);
+                    if ui.selectable_label(false, label).clicked() || (k == 0 && enter) {
+                        chosen = Some((p.lat, p.lon, p.name.clone()));
+                    }
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("📍 Pick on the map").clicked() {
+                    self.picking_on_map = true;
+                    self.picker_open = false;
+                }
+                ui.label(egui::RichText::new("then click a spot").small().weak());
+            });
+        });
+        if let Some((lat, lon, name)) = chosen {
+            self.set_location(lat, lon, Some(name));
+            self.map_centre = Some((lat, lon));
+            open = false;
+        }
+        if self.picker_open {
+            self.picker_open = open;
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui, nc: Option<&Nowcast>, error: Option<&str>, checking: bool, last_check: Option<DateTime<Utc>>) {
@@ -639,25 +928,35 @@ impl App {
                 ui.text_edit_singleline(&mut self.settings.place);
                 ui.end_row();
                 ui.label("Latitude");
-                ui.add(egui::DragValue::new(&mut self.settings.lat).speed(0.01).range(48.9..=56.0).max_decimals(4));
+                ui.add(egui::DragValue::new(&mut self.settings.lat).speed(0.01).range(30.0..=72.0).max_decimals(4));
                 ui.end_row();
                 ui.label("Longitude");
-                ui.add(egui::DragValue::new(&mut self.settings.lon).speed(0.01).range(0.0..=10.8).max_decimals(4));
+                ui.add(egui::DragValue::new(&mut self.settings.lon).speed(0.01).range(-30.0..=45.0).max_decimals(4));
                 ui.end_row();
                 ui.label("KNMI API key");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("replace key").desired_width(180.0));
+                    let hint = if config::api_key().is_some() { "replace key" } else { "for the Dutch radar" };
+                    ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text(hint).desired_width(180.0));
                     if ui.button("Save").clicked() && !self.key_input.trim().is_empty() {
-                        self.save_key();
+                        self.save_key(false);
+                    }
+                });
+                ui.end_row();
+                ui.label("MeteoGate API key");
+                ui.horizontal(|ui| {
+                    let hint = if config::meteogate_key().is_some() { "replace key" } else { "optional, for OPERA" };
+                    ui.add(egui::TextEdit::singleline(&mut self.meteogate_input).password(true).hint_text(hint).desired_width(180.0));
+                    if ui.button("Save").clicked() && !self.meteogate_input.trim().is_empty() {
+                        self.save_key(true);
                     }
                 });
                 ui.end_row();
             });
             ui.add_space(6.0);
-            if config::EMBEDDED_KEY.is_some() {
-                ui.label(egui::RichText::new("This build has a KNMI key built in; a key saved here takes precedence.").small().weak());
+            if config::EMBEDDED_KEY.is_some() || config::EMBEDDED_METEOGATE_KEY.is_some() {
+                ui.label(egui::RichText::new("This build has API keys built in; keys saved here take precedence.").small().weak());
             }
-            ui.label(egui::RichText::new("Tip: click the map to set your location.").small().weak());
+            ui.label(egui::RichText::new("Tip: click the place name at the top to search for a town, or pick a spot on the map.").small().weak());
             if ui.button("Refresh now").clicked() {
                 let _ = self.commands.send(Command::Refresh);
             }
@@ -673,6 +972,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn place_search_ignores_case_and_accents() {
+        assert_eq!(fold("Düsseldorf"), "dusseldorf");
+        assert_eq!(fold("ZÜRICH"), "zurich");
+        assert_eq!(fold("'s-Hertogenbosch"), "s-hertogenbosch");
+        assert_eq!(fold("Kraków"), "krakow");
+    }
 
     #[test]
     fn rain_axis_is_monotonic() {

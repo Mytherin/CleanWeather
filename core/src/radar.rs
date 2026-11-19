@@ -1,27 +1,130 @@
-//! Decoding KNMI radar reflectivity composites (HDF5, `RAD_NL25_PCP_NA_*.h5`).
+//! Radar scans and their grids, and decoding KNMI radar reflectivity composites
+//! (HDF5, `RAD_NL25_PCP_NA_*.h5`).
 //!
-//! Each file is one 5-minute scan: a 700 × 765 grid of 1 km pixels on a polar
+//! A KNMI file is one 5-minute scan: a 700 × 765 grid of 1 km pixels on a polar
 //! stereographic projection, holding reflectivity in dBZ (`dBZ = 0.5 · PV − 32`).
+//! OPERA's European composite (see `opera.rs`) uses a Lambert azimuthal equal-area grid.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use hdf5_reader::Hdf5File;
 use hdf5_reader::group::Group;
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
 use std::path::Path;
 
 /// Below this reflectivity a pixel is treated as dry (≈ 0.1 mm/h).
 pub const RAIN_DBZ: f32 = 7.0;
 
-/// The grid's projection: `+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60` on an ellipsoid,
-/// with KNMI's pixel offsets. Coordinates in km.
+/// A map projection from lat/lon to plane coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Projection {
+    /// `+proj=stere +lat_0=90 +lon_0=0 +lat_ts=…` on an ellipsoid (KNMI), in the
+    /// ellipsoid's units. ρ = k · t(φ).
+    PolarStereo { e: f64, k: f64 },
+    /// `+proj=laea` on an ellipsoid, oblique aspect (OPERA).
+    Laea(Laea),
+}
+
+impl Projection {
+    fn forward(&self, lat: f64, lon: f64) -> (f64, f64) {
+        match self {
+            Projection::PolarStereo { e, k } => {
+                let (phi, lam) = (lat.to_radians(), lon.to_radians());
+                let rho = k * t(phi, *e);
+                (rho * lam.sin(), -rho * lam.cos())
+            }
+            Projection::Laea(p) => p.forward(lat, lon),
+        }
+    }
+
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            Projection::PolarStereo { e, k } => {
+                let rho = x.hypot(y);
+                let tt = rho / k;
+                // Iterate φ = π/2 − 2·atan(t · ((1 − e sinφ)/(1 + e sinφ))^(e/2)).
+                let mut phi = FRAC_PI_2 - 2.0 * tt.atan();
+                for _ in 0..8 {
+                    let es = e * phi.sin();
+                    phi = FRAC_PI_2 - 2.0 * (tt * ((1.0 - es) / (1.0 + es)).powf(e / 2.0)).atan();
+                }
+                (phi.to_degrees(), x.atan2(-y).to_degrees())
+            }
+            Projection::Laea(p) => p.inverse(x, y),
+        }
+    }
+}
+
+/// Lambert azimuthal equal-area on an ellipsoid (Snyder, "Map Projections — A Working
+/// Manual", oblique aspect), with false easting/northing. Plane units are metres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Laea {
+    e: f64,
+    qp: f64,
+    rq: f64,
+    d: f64,
+    sin_b1: f64,
+    cos_b1: f64,
+    lon0: f64,
+    fe: f64,
+    fn_: f64,
+}
+
+impl Laea {
+    pub fn new(a: f64, inv_f: f64, lat0: f64, lon0: f64, fe: f64, fn_: f64) -> Laea {
+        let f = 1.0 / inv_f;
+        let e = (2.0 * f - f * f).sqrt();
+        let qp = q(FRAC_PI_2, e);
+        let rq = a * (qp / 2.0).sqrt();
+        let phi1 = lat0.to_radians();
+        let b1 = (q(phi1, e) / qp).asin();
+        let m1 = phi1.cos() / (1.0 - e * e * phi1.sin().powi(2)).sqrt();
+        let d = a * m1 / (rq * b1.cos());
+        Laea { e, qp, rq, d, sin_b1: b1.sin(), cos_b1: b1.cos(), lon0: lon0.to_radians(), fe, fn_ }
+    }
+
+    fn forward(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let b = (q(lat.to_radians(), self.e) / self.qp).clamp(-1.0, 1.0).asin();
+        let dl = lon.to_radians() - self.lon0;
+        let bb = self.rq * (2.0 / (1.0 + self.sin_b1 * b.sin() + self.cos_b1 * b.cos() * dl.cos())).sqrt();
+        let x = bb * self.d * b.cos() * dl.sin();
+        let y = (bb / self.d) * (self.cos_b1 * b.sin() - self.sin_b1 * b.cos() * dl.cos());
+        (x + self.fe, y + self.fn_)
+    }
+
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = (x - self.fe, y - self.fn_);
+        let rho = ((x / self.d).powi(2) + (self.d * y).powi(2)).sqrt();
+        if rho < 1e-9 {
+            return (self.sin_b1.asin().to_degrees(), self.lon0.to_degrees());
+        }
+        let ce = 2.0 * (rho / (2.0 * self.rq)).clamp(-1.0, 1.0).asin();
+        let b = (ce.cos() * self.sin_b1 + self.d * y * ce.sin() * self.cos_b1 / rho).clamp(-1.0, 1.0).asin();
+        let lam = self.lon0 + (x * ce.sin()).atan2(self.d * rho * self.cos_b1 * ce.cos() - self.d * self.d * y * self.sin_b1 * ce.sin());
+        let e2 = self.e * self.e;
+        let (e4, e6) = (e2 * e2, e2 * e2 * e2);
+        let phi = b
+            + (e2 / 3.0 + 31.0 * e4 / 180.0 + 517.0 * e6 / 5040.0) * (2.0 * b).sin()
+            + (23.0 * e4 / 360.0 + 251.0 * e6 / 3780.0) * (4.0 * b).sin()
+            + (761.0 * e6 / 45360.0) * (6.0 * b).sin();
+        (phi.to_degrees(), lam.to_degrees())
+    }
+}
+
+/// Snyder's q(φ) for equal-area projections.
+fn q(phi: f64, e: f64) -> f64 {
+    let s = phi.sin();
+    (1.0 - e * e) * (s / (1.0 - e * e * s * s) - (1.0 / (2.0 * e)) * ((1.0 - e * s) / (1.0 + e * s)).ln())
+}
+
+/// A raster of pixels on a projection: pixel (col, row) covers plane coordinates
+/// `x = (col + col_offset) · px_x`, `y = (row + row_offset) · px_y` (its corner), so
+/// pixel centres are at +0.5. Row 0 is the north edge (`px_y` is negative).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Grid {
     pub width: usize,
     pub height: usize,
-    a: f64,
-    e: f64,
-    /// ρ = k · t(φ): the scale fixed by the true-scale latitude.
-    k: f64,
+    proj: Projection,
     px_x: f64,
     px_y: f64,
     col_offset: f64,
@@ -29,57 +132,56 @@ pub struct Grid {
 }
 
 impl Grid {
-    fn new(width: usize, height: usize, a_km: f64, b_km: f64, lat_ts: f64, px: (f64, f64), off: (f64, f64)) -> Grid {
-        let e = (1.0 - (b_km * b_km) / (a_km * a_km)).sqrt();
+    pub fn new(width: usize, height: usize, proj: Projection, px: (f64, f64), off: (f64, f64)) -> Grid {
+        Grid { width, height, proj, px_x: px.0, px_y: px.1, col_offset: off.0, row_offset: off.1 }
+    }
+
+    fn polar_stereo(width: usize, height: usize, a: f64, b: f64, lat_ts: f64, px: (f64, f64), off: (f64, f64)) -> Grid {
+        let e = (1.0 - (b * b) / (a * a)).sqrt();
         let phi_c = lat_ts.to_radians();
-        let (t_c, m_c) = (t(phi_c, e), m(phi_c, e));
-        Grid {
-            width,
-            height,
-            a: a_km,
-            e,
-            k: a_km * m_c / t_c,
-            px_x: px.0,
-            px_y: px.1,
-            col_offset: off.0,
-            row_offset: off.1,
-        }
+        let k = a * m(phi_c, e) / t(phi_c, e);
+        Grid::new(width, height, Projection::PolarStereo { e, k }, px, off)
     }
 
     /// The grid of current KNMI composites, for when no file has been read yet.
     pub fn knmi() -> Grid {
-        Grid::new(700, 765, 6378.137, 6356.752, 60.0, (1.0000026, -1.0000044), (0.0, 3649.9795))
+        Grid::polar_stereo(700, 765, 6378.137, 6356.752, 60.0, (1.0000026, -1.0000044), (0.0, 3649.9795))
+    }
+
+    /// A window of this grid: `width × height` pixels starting at (col, row).
+    pub fn crop(&self, col: usize, row: usize, width: usize, height: usize) -> Grid {
+        Grid { width, height, col_offset: self.col_offset + col as f64, row_offset: self.row_offset + row as f64, ..*self }
     }
 
     /// Fractional pixel position (column, row) of a lat/lon; pixel centres are at +0.5.
     pub fn to_pixel(&self, lat: f64, lon: f64) -> (f64, f64) {
-        let (phi, lam) = (lat.to_radians(), lon.to_radians());
-        let rho = self.k * t(phi, self.e);
-        let (x, y) = (rho * lam.sin(), -rho * lam.cos());
+        let (x, y) = self.proj.forward(lat, lon);
         (x / self.px_x - self.col_offset, y / self.px_y - self.row_offset)
     }
 
     /// Lat/lon of a fractional pixel position (inverse of [`Grid::to_pixel`]).
     pub fn to_latlon(&self, col: f64, row: f64) -> (f64, f64) {
-        let x = (col + self.col_offset) * self.px_x;
-        let y = (row + self.row_offset) * self.px_y;
-        let rho = x.hypot(y);
-        let tt = rho / self.k;
-        // Iterate φ = π/2 − 2·atan(t · ((1 − e sinφ)/(1 + e sinφ))^(e/2)).
-        let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * tt.atan();
-        for _ in 0..8 {
-            let es = self.e * phi.sin();
-            phi = std::f64::consts::FRAC_PI_2 - 2.0 * (tt * ((1.0 - es) / (1.0 + es)).powf(self.e / 2.0)).atan();
+        self.proj.inverse((col + self.col_offset) * self.px_x, (row + self.row_offset) * self.px_y)
+    }
+
+    /// The size of a pixel in km (KNMI's plane is in km, OPERA's in metres).
+    pub fn pixel_km(&self) -> f64 {
+        match self.proj {
+            Projection::PolarStereo { .. } => self.px_x.abs(),
+            Projection::Laea(_) => self.px_x.abs() / 1000.0,
         }
-        let lam = x.atan2(-y);
-        let _ = self.a;
-        (phi.to_degrees(), lam.to_degrees())
+    }
+
+    /// Whether a lat/lon falls on the grid.
+    pub fn contains(&self, lat: f64, lon: f64) -> bool {
+        let (c, r) = self.to_pixel(lat, lon);
+        c >= 0.0 && r >= 0.0 && c < self.width as f64 && r < self.height as f64
     }
 }
 
 fn t(phi: f64, e: f64) -> f64 {
     let es = e * phi.sin();
-    (std::f64::consts::FRAC_PI_4 - phi / 2.0).tan() / ((1.0 - es) / (1.0 + es)).powf(e / 2.0)
+    (FRAC_PI_4 - phi / 2.0).tan() / ((1.0 - es) / (1.0 + es)).powf(e / 2.0)
 }
 
 fn m(phi: f64, e: f64) -> f64 {
@@ -97,6 +199,8 @@ pub struct Frame {
     /// Names of the radars that contributed, and of those that were down.
     pub radars_up: Vec<String>,
     pub radars_down: Vec<String>,
+    /// Where the scan came from ("KNMI", "OPERA").
+    pub source: &'static str,
 }
 
 impl Frame {
@@ -129,7 +233,7 @@ impl Frame {
         }
         let width = num(&geo, "geo_number_columns")? as usize;
         let height = num(&geo, "geo_number_rows")? as usize;
-        let grid = Grid::new(
+        let grid = Grid::polar_stereo(
             width,
             height,
             a,
@@ -153,26 +257,57 @@ impl Frame {
             bail!("image is {shape:?}, expected {height}×{width}");
         }
         let pv: Vec<u8> = data.read_array::<u8>()?.iter().copied().collect();
-        let dbz = pv
+        let dbz: Vec<f32> = pv
             .iter()
             .map(|&v| if v == outside { f32::NAN } else { gain * v as f32 + offset })
             .collect();
 
         let (mut radars_up, mut radars_down) = (Vec::new(), Vec::new());
+        let mut sites = Vec::new();
         let n = file.group("/overview").ok().and_then(|g| num(&g, "number_radar_groups").ok());
         for i in 1..=n.unwrap_or(0.0) as usize {
             let Ok(g) = file.group(&format!("/radar{i}")) else { continue };
             let name = g.attribute("radar_name").and_then(|a| a.read_string()).unwrap_or_default();
             match num(&g, "radar_operational") {
-                Ok(v) if v != 0.0 => radars_up.push(name),
+                Ok(v) if v != 0.0 => {
+                    radars_up.push(name);
+                    // [lon, lat]
+                    if let Some(loc) = g.attribute("radar_location").ok().and_then(|a| a.read_1d::<f32>().ok()).filter(|l| l.len() == 2) {
+                        sites.push((loc[1] as f64, loc[0] as f64));
+                    }
+                }
                 _ => radars_down.push(name),
             }
         }
-        Ok(Frame { time, grid, dbz, radars_up, radars_down })
+        let mut dbz = dbz;
+        mask_beyond_range(&mut dbz, &grid, &sites);
+        Ok(Frame { time, grid, dbz, radars_up, radars_down, source: "KNMI" })
     }
 
     pub fn get(&self, col: usize, row: usize) -> f32 {
         self.dbz[row * self.grid.width + col]
+    }
+}
+
+/// How far from a radar KNMI's composite is trusted. The file reports "no echo" across
+/// its whole grid, also far beyond where the radars see (and low rain is below a far
+/// radar's beam), so pixels further than this from every operational radar are marked
+/// as having no data.
+pub const KNMI_RANGE_KM: f64 = 250.0;
+
+fn mask_beyond_range(dbz: &mut [f32], grid: &Grid, sites: &[(f64, f64)]) {
+    if sites.is_empty() {
+        return; // unknown radar positions: keep everything
+    }
+    let centres: Vec<(f64, f64)> = sites.iter().map(|&(lat, lon)| grid.to_pixel(lat, lon)).collect();
+    let r_px = KNMI_RANGE_KM / grid.pixel_km();
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let (x, y) = (col as f64 + 0.5, row as f64 + 0.5);
+            if centres.iter().all(|&(cx, cy)| (x - cx).hypot(y - cy) > r_px) {
+                dbz[row * grid.width + col] = f32::NAN;
+            }
+        }
     }
 }
 

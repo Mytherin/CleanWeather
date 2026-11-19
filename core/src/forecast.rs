@@ -125,7 +125,7 @@ pub fn fetch(lat: f64, lon: f64) -> Result<Forecast> {
          &current=temperature_2m,weather_code,wind_speed_10m,is_day\
          &daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,\
          precipitation_probability_max,wind_speed_10m_max,wind_direction_10m_dominant\
-         &timezone=Europe%2FAmsterdam&forecast_days=7"
+         &timezone=auto&forecast_days=7"
     );
     let resp = ureq::get(&url)
         .timeout(Duration::from_secs(20))

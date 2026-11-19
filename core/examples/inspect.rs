@@ -9,6 +9,8 @@ fn walk(g: &Group, path: &str) {
             .map(|s| format!("{s:?}"))
             .or_else(|_| a.read_1d::<f32>().map(|v| format!("{v:?}")))
             .or_else(|_| a.read_1d::<i32>().map(|v| format!("{v:?}")))
+            .or_else(|_| a.read_1d::<f64>().map(|v| format!("{v:?}")))
+            .or_else(|_| a.read_1d::<u64>().map(|v| format!("{v:?}")))
             .unwrap_or_else(|e| format!("<{e}>"));
         println!("{path}@{} = {v}", a.name);
     }
