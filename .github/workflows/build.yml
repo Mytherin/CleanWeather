@@ -1,0 +1,116 @@
+# Builds and tests CleanWeather for Windows and macOS.
+#
+# It runs on pushes and pull requests to main, when a tag like v0.1.0 is pushed
+# (git tag v0.1.0 && git push origin v0.1.0), and by hand from Actions → Build →
+# Run workflow.
+#
+# - Every run: the tests, plus a live check against KNMI (see below); the builds are
+#   artifacts of the run (Actions → the run → Artifacts).
+# - A tag: the builds are also attached to a GitHub release.
+#
+# The live check needs a repository secret KNMI_API_KEY (Settings → Secrets and
+# variables → Actions). It's only used to fetch real radar data and run a forecast,
+# which catches KNMI changing their API or file format. The key is never built into
+# the app: anyone with the .exe could read it out. Without the secret (e.g. on forks)
+# the check is skipped.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Local builds embed the developer's KNMI key (build.rs); builds for download must
+  # not. build.rs already skips it when CI is set; this makes it explicit.
+  CLEANWEATHER_NO_EMBED: "1"
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build --release --bin CleanWeather --bin rain
+      - name: Live check against KNMI
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$KNMI_API_KEY" ]; then echo "::notice::No KNMI_API_KEY secret; skipping the live check"; exit 0; fi
+          # The key must not have ended up in the downloadable binaries.
+          if grep -qF "$KNMI_API_KEY" target/release/CleanWeather.exe target/release/rain.exe; then echo "::error::KNMI key found in the binaries"; exit 1; fi
+          target/release/rain.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanWeather-Windows
+          path: |
+            target/release/CleanWeather.exe
+            target/release/rain.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build --release --bin CleanWeather --bin rain
+      - name: Live check against KNMI
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}
+        run: |
+          if [ -z "$KNMI_API_KEY" ]; then echo "::notice::No KNMI_API_KEY secret; skipping the live check"; exit 0; fi
+          if grep -qF "$KNMI_API_KEY" target/release/CleanWeather target/release/rain; then echo "::error::KNMI key found in the binaries"; exit 1; fi
+          target/release/rain
+      # Plain binaries for Apple Silicon, unsigned: the first time, allow them in
+      # System Settings → Privacy & Security, or run `xattr -d com.apple.quarantine`.
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/CleanWeather-macOS.tar.gz -C target/release CleanWeather rain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanWeather-macOS
+          path: dist/CleanWeather-macOS.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Name the files after the release
+        run: |
+          mkdir out
+          cp dist/CleanWeather-Windows/CleanWeather.exe "out/CleanWeather-${GITHUB_REF_NAME}-Windows.exe"
+          cp dist/CleanWeather-Windows/rain.exe "out/rain-${GITHUB_REF_NAME}-Windows.exe"
+          cp dist/CleanWeather-macOS/CleanWeather-macOS.tar.gz "out/CleanWeather-${GITHUB_REF_NAME}-macOS.tar.gz"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

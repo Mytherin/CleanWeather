@@ -1,0 +1,4 @@
+/target
+# Never commit the KNMI API key (it lives in the user's config folder, but just in case).
+api_key.txt
+*.h5

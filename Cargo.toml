@@ -1,0 +1,39 @@
+[workspace]
+members = [".", "core"]
+resolver = "2"
+
+# The desktop app (egui) and the `rain` command-line tool. Fetching radar data from
+# KNMI, decoding it and the nowcast live in `core/`, so an iPhone app can share them.
+[package]
+name = "clean-weather"
+version = "0.1.0"
+edition = "2024"
+description = "Rain nowcast for the Netherlands from KNMI radar, like Buienalarm"
+default-run = "CleanWeather"
+
+[[bin]]
+name = "CleanWeather"
+path = "src/main.rs"
+
+[[bin]]
+name = "rain"
+path = "src/bin/rain.rs"
+
+[dependencies]
+cleanweather-core = { path = "core" }
+anyhow = "1"
+chrono = "0.4"
+directories = "5"
+eframe = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+# build.rs finds the key file the app saves, to embed it in local builds.
+directories = "5"
+
+# The nowcast is number crunching; keep debug builds usable.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 2
