@@ -1,0 +1,46 @@
+import XCTest
+@testable import CleanWeather
+
+/// The app's own Swift (headlines, formatting, the map's images) against the Rust core.
+final class CleanWeatherTests: XCTestCase {
+    func testHeadlines() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let in20 = Int64(1_800_000_000 + 20 * 60)
+        XCTAssertTrue(Format.headline(.rainFrom(at: in20, peak: 2), now: now).hasPrefix("Moderate rain in 20 min ("))
+        XCTAssertEqual(Format.headline(.rainFrom(at: 1_800_000_000, peak: 0.5), now: now), "Light rain now")
+        XCTAssertTrue(Format.headline(.dry(until: in20), now: now).hasPrefix("Dry until at least "))
+        XCTAssertEqual(Format.headline(.raining(until: nil, peak: 25), now: now), "Rain for the next 2 hours (up to very heavy rain)")
+        XCTAssertEqual(Format.headline(.noData, now: now), "No radar coverage here")
+    }
+
+    func testDegreesAndDays() {
+        XCTAssertEqual(Format.degrees(-0.4), "0°")
+        XCTAssertEqual(Format.degrees(6.6), "7°")
+        let cal = Calendar(identifier: .gregorian)
+        let today = cal.date(from: DateComponents(year: 2026, month: 11, day: 23, hour: 12))!
+        let day = { (d: UInt32) in
+            DayForecast(year: 2026, month: 11, day: d, kind: .rain, label: "Rain", max: 9, min: 3, rainMm: 2.5,
+                        rainChance: 80, windKmh: 20, beaufort: 3, windFrom: "SW")
+        }
+        XCTAssertEqual(Format.dayName(day(23), today: today, calendar: cal), "Today")
+        XCTAssertEqual(Format.dayName(day(24), today: today, calendar: cal), "Tomorrow")
+        XCTAssertFalse(Format.dayName(day(26), today: today, calendar: cal).isEmpty)
+    }
+
+    func testPlacesFromTheCore() {
+        XCTAssertEqual(searchPlaces(query: "dusseldorf", limit: 3).first?.name, "Düsseldorf")
+        XCTAssertEqual(placeName(lat: 52.09, lon: 5.12), "Utrecht")
+    }
+
+    func testMapImagesBecomeCGImages() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cleanweather-tests").path
+        let core = WeatherCore(cacheDir: dir, knmiKey: nil, meteogateKey: nil)
+        XCTAssertNil(core.rain(lat: 52.1, lon: 5.1), "no nowcast before a refresh")
+        let canvas = core.mapCanvas(centreLat: 52.1, centreLon: 5.1, zoom: 7, width: 120, height: 80, scale: 2)
+        let base = try XCTUnwrap(canvas.baseImage(dark: false).cgImage())
+        XCTAssertEqual(base.width, 240)
+        XCTAssertEqual(base.height, 160)
+        XCTAssertNotNil(canvas.radarImage(frame: 0, dark: true).cgImage())
+        XCTAssertFalse(canvas.labels(pinLat: 52.1, pinLon: 5.1).isEmpty)
+    }
+}

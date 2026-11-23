@@ -173,6 +173,66 @@ impl MapData {
             .map(|p| (p, ((p.lat - lat) * 111.2).hypot((p.lon - lon) * 111.2 * lat.to_radians().cos())))
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
+
+    /// A name for a location: the town there, "Near" one within 25 km, or a generic one.
+    pub fn name_for(&self, lat: f64, lon: f64) -> String {
+        match self.nearest_place(lat, lon) {
+            Some((p, d)) if d < 4.0 => p.name.clone(),
+            Some((p, d)) if d < 25.0 => format!("Near {}", p.name),
+            _ => "Selected location".into(),
+        }
+    }
+
+    /// Towns whose name contains `query` (ignoring case and accents): names starting
+    /// with it first, then bigger towns first; at most `limit`.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<&Place> {
+        let q = fold(query.trim());
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<(bool, &Place)> = self
+            .places
+            .iter()
+            .filter_map(|p| {
+                let name = fold(&p.name);
+                name.contains(&q).then(|| (name.starts_with(&q), p))
+            })
+            .collect();
+        hits.sort_by_key(|(starts, p)| (!starts, std::cmp::Reverse(p.population)));
+        hits.into_iter().take(limit).map(|(_, p)| p).collect()
+    }
+}
+
+/// Lowercase without accents, for matching typed place names ("dusseldorf", "zurich").
+pub fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        let base = match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ą' | 'ă' => "a",
+            'ç' | 'ć' | 'č' => "c",
+            'ď' => "d",
+            'è' | 'é' | 'ê' | 'ë' | 'ę' | 'ě' => "e",
+            'ğ' => "g",
+            'ì' | 'í' | 'î' | 'ï' | 'ı' => "i",
+            'ł' => "l",
+            'ñ' | 'ń' | 'ň' => "n",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ő' => "o",
+            'ř' => "r",
+            'ś' | 'š' | 'ș' | 'ş' => "s",
+            'ß' => "ss",
+            'ț' | 'ţ' | 'ť' => "t",
+            'ù' | 'ú' | 'û' | 'ü' | 'ů' | 'ű' => "u",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            '\'' | '’' => "",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        out.push_str(base);
+    }
+    out
 }
 
 /// Douglas–Peucker simplification in the points' own units.
@@ -266,6 +326,20 @@ mod tests {
             assert_eq!(p.name, name);
             assert!(d < 5.0, "{name}: {d} km");
         }
+    }
+
+    #[test]
+    fn searches_places_ignoring_case_and_accents() {
+        let m = map();
+        assert_eq!(fold("Düsseldorf"), "dusseldorf");
+        assert_eq!(fold("'s-Hertogenbosch"), "s-hertogenbosch");
+        let hits = m.search("dusseld", 5);
+        assert!(hits.first().is_some_and(|p| p.name == "Düsseldorf"), "{:?}", hits.iter().map(|p| &p.name).collect::<Vec<_>>());
+        let ams = m.search("AMSTER", 5);
+        assert_eq!(ams[0].name, "Amsterdam");
+        assert!(m.search("   ", 5).is_empty());
+        assert_eq!(m.name_for(52.373, 4.893), "Amsterdam");
+        assert_eq!(m.name_for(0.0, -30.0), "Selected location");
     }
 
     #[test]

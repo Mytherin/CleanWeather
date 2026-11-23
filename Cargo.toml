@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "core"]
+members = [".", "core", "ffi"]
 resolver = "2"
 
 # The desktop app (egui) and the `rain` command-line tool. Fetching radar data from

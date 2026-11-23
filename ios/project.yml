@@ -1,0 +1,81 @@
+# The iPhone app's Xcode project, for XcodeGen (`brew install xcodegen`):
+#
+#   ios/build-rust.sh && cd ios && xcodegen && open CleanWeather.xcodeproj
+#
+# The Rust core is built by ios/build-rust.sh, which the project runs before
+# compiling (the first build takes a few minutes).
+name: CleanWeather
+options:
+  bundleIdPrefix: com.cleanweather
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: ""
+targets:
+  CleanWeather:
+    type: application
+    platform: iOS
+    # The CleanWeather scheme runs the tests (xcodebuild test -scheme CleanWeather).
+    scheme:
+      testTargets:
+        - CleanWeatherTests
+    sources:
+      - path: CleanWeather
+      - path: Generated/cleanweather_ffi.swift
+        optional: true
+        createIntermediateGroups: true
+    dependencies:
+      - framework: build/CleanWeatherCore.xcframework
+        embed: false
+        link: true
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+    preBuildScripts:
+      - name: Build the Rust core
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "$CONFIGURATION" = "Debug" ]; then
+            "$PROJECT_DIR/build-rust.sh" --debug
+          else
+            "$PROJECT_DIR/build-rust.sh"
+          fi
+        outputFiles:
+          - $(PROJECT_DIR)/Generated/cleanweather_ffi.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cleanweather.CleanWeather
+        PRODUCT_NAME: CleanWeather
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Weather
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your location is used to forecast rain where you are. Only a rounded location (about 1 km) leaves your iPhone, for the 7-day forecast.
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+  # Unit tests of the app's Swift (the headline and formatting) against the Rust
+  # core, run in the app on the iOS Simulator:
+  #   xcodebuild test -project CleanWeather.xcodeproj -scheme CleanWeather \
+  #     -destination 'platform=iOS Simulator,name=iPhone 16'
+  CleanWeatherTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: CleanWeatherTests
+    dependencies:
+      - target: CleanWeather
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cleanweather.CleanWeatherTests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic

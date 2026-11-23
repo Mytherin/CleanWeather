@@ -1,0 +1,32 @@
+[package]
+name = "cleanweather-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "CleanWeather's core for Swift (the iPhone app), through UniFFI."
+
+[lib]
+name = "cleanweather_ffi"
+# staticlib for the iOS app (in an XCFramework); cdylib for generating the
+# Swift bindings from the library's metadata; lib for the tests.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[[example]]
+name = "make_icon"
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+cleanweather-core = { path = "../core" }
+anyhow = "1"
+chrono = "0.4"
+uniffi = "0.29"
+
+[dev-dependencies]
+# The app icon is written as a PNG by `examples/make_icon.rs`.
+flate2 = "1"

@@ -1,4 +1,4 @@
-# Builds and tests CleanWeather for Windows and macOS.
+# Builds and tests CleanWeather for Windows, macOS and the iPhone.
 #
 # It runs on pushes and pull requests to main, when a tag like v0.1.0 is pushed
 # (git tag v0.1.0 && git push origin v0.1.0), and by hand from Actions → Build →
@@ -95,10 +95,63 @@ jobs:
           path: dist/CleanWeather-macOS.tar.gz
           if-no-files-found: error
 
+  iphone:
+    name: iPhone
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      # The Swift bindings must exist before the project is made.
+      - name: Build the Rust core
+        run: ios/build-rust.sh
+      - name: Make the Xcode project
+        working-directory: ios
+        run: xcodegen
+      # The app's Swift tests (ios/CleanWeatherTests), on the first iPhone
+      # simulator the runner has (their names change with Xcode).
+      - name: Test on the iOS Simulator
+        working-directory: ios
+        run: |
+          UDID=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 \
+            | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')
+          echo "Simulator: $UDID"
+          xcodebuild test -project CleanWeather.xcodeproj -scheme CleanWeather \
+            -destination "id=$UDID" CODE_SIGNING_ALLOWED=NO
+      # Unsigned: install it with a tool that signs it with your Apple ID
+      # (Sideloadly, AltStore).
+      - name: Build for iPhone (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild -project CleanWeather.xcodeproj -target CleanWeather -configuration Release \
+            -sdk iphoneos SYMROOT="$PWD/xcbuild" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          mkdir -p ../dist/Payload
+          cp -R xcbuild/Release-iphoneos/CleanWeather.app ../dist/Payload/
+          (cd ../dist && zip -qr CleanWeather-unsigned.ipa Payload && rm -rf Payload)
+      - name: Build for the iOS Simulator
+        working-directory: ios
+        run: |
+          xcodebuild -project CleanWeather.xcodeproj -target CleanWeather -configuration Release \
+            -sdk iphonesimulator SYMROOT="$PWD/xcbuild" \
+            CODE_SIGNING_ALLOWED=NO build
+          (cd xcbuild/Release-iphonesimulator && zip -qr ../../../dist/CleanWeather-Simulator.zip CleanWeather.app)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanWeather-iPhone
+          path: |
+            dist/CleanWeather-unsigned.ipa
+            dist/CleanWeather-Simulator.zip
+          if-no-files-found: error
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, macos]
+    needs: [windows, macos, iphone]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -110,6 +163,8 @@ jobs:
           cp dist/CleanWeather-Windows/CleanWeather.exe "out/CleanWeather-${GITHUB_REF_NAME}-Windows.exe"
           cp dist/CleanWeather-Windows/rain.exe "out/rain-${GITHUB_REF_NAME}-Windows.exe"
           cp dist/CleanWeather-macOS/CleanWeather-macOS.tar.gz "out/CleanWeather-${GITHUB_REF_NAME}-macOS.tar.gz"
+          cp dist/CleanWeather-iPhone/CleanWeather-unsigned.ipa "out/CleanWeather-${GITHUB_REF_NAME}-iPhone-unsigned.ipa"
+          cp dist/CleanWeather-iPhone/CleanWeather-Simulator.zip "out/CleanWeather-${GITHUB_REF_NAME}-iOS-Simulator.zip"
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*
