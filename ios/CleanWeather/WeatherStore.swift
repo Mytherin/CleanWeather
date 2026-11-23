@@ -125,8 +125,10 @@ final class WeatherStore: ObservableObject {
             UserDefaults.standard.set(data, forKey: "location")
         }
         guard moved else { return }
-        // The current nowcast may already cover the new place; then check for the right radar.
-        rain = core.rain(lat: loc.lat, lon: loc.lon)
+        // The current nowcast may already cover the new place; if it doesn't, show that
+        // the radar is coming rather than "no coverage" until the refresh is done.
+        let here = core.rain(lat: loc.lat, lon: loc.lon)
+        rain = here?.outlook == .noData ? nil : here
         week = nil
         forecastFetched = nil
         Task { await refresh() }
