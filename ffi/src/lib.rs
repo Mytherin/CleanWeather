@@ -139,6 +139,8 @@ pub struct RadarRefresh {
 #[derive(Default)]
 struct Latest {
     nowcast: Option<Arc<Nowcast>>,
+    /// Where the nowcast was made for.
+    at: Option<(f64, f64)>,
     source: Option<&'static str>,
     fallback: Option<String>,
     europe: Option<Arc<Nowcast>>,
@@ -199,13 +201,23 @@ impl WeatherCore {
         let error = match local {
             Ok(Some(u)) => {
                 latest.nowcast = Some(Arc::new(u.nowcast));
+                latest.at = Some((lat, lon));
                 latest.source = Some(u.source);
                 latest.fallback = u.fallback_reason;
                 changed = true;
                 None
             }
             Ok(None) => None,
-            Err(e) => Some(format!("{e:#}")),
+            Err(e) => {
+                // A nowcast for somewhere else (cropped around that place, ever older)
+                // would only mislead here: drop it. At the same place, keep it; the app
+                // shows its age.
+                if latest.at.is_some_and(|(a, b)| (a - lat).abs() > 0.005 || (b - lon).abs() > 0.005) {
+                    *latest = Latest { europe: latest.europe.take(), ..Latest::default() };
+                    changed = true;
+                }
+                Some(format!("{e:#}"))
+            }
         };
         RadarRefresh { changed, error }
     }

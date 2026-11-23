@@ -81,8 +81,12 @@ final class WeatherStore: ObservableObject {
         let radar = await Task.detached(priority: .userInitiated) {
             core.refreshRadar(lat: loc.lat, lon: loc.lon)
         }.value
-        // The location may have changed meanwhile: show the rain where it is now. If no
-        // radar works there, an old nowcast's "no coverage" would hide the reason why.
+        // The place changed meanwhile: its own refresh will show it; only redraw the map.
+        guard loc == location else {
+            if radar.changed { radarVersion += 1 }
+            return
+        }
+        // If no radar works here, an old nowcast's "no coverage" would hide the reason why.
         let here = core.rain(lat: location.lat, lon: location.lon)
         rain = radar.error != nil && here?.outlook == .noData ? nil : here
         lastCheck = Date()
@@ -147,6 +151,8 @@ final class WeatherStore: ObservableObject {
     /// keeps the last known place).
     private func followDevice() async {
         guard location.followsDevice, let here = try? await locator.current() else { return }
+        // A place chosen while the fix was coming wins.
+        guard location.followsDevice else { return }
         let (lat, lon) = (here.coordinate.latitude, here.coordinate.longitude)
         let loc = WeatherLocation(name: placeName(lat: lat, lon: lon), lat: lat, lon: lon, followsDevice: true)
         if Self.moved(from: (location.lat, location.lon), to: loc) {

@@ -163,20 +163,26 @@ impl MapCanvas {
         let view = View::centred(lat, lon, zoom, width as f64, height as f64);
         let layer = |nowcast: Arc<Nowcast>| Layer { nowcast, lookup: OnceLock::new() };
         let (local, europe) = (local.map(layer), europe.map(layer));
-        // The timeline follows the local radar's frames, else Europe's.
+        // The timeline follows whichever layer has the newer scan (the local radar when
+        // they're equal), so a lagging or old layer never holds the map back; each
+        // layer shows its frame nearest in time, within 5 minutes.
         let mut timeline = Vec::new();
-        let base = local.as_ref().or(europe.as_ref());
+        let base = match (&local, &europe) {
+            (Some(l), Some(e)) if e.nowcast.issued > l.nowcast.issued => Some(e),
+            (Some(l), _) => Some(l),
+            (None, e) => e.as_ref(),
+        };
         if let Some(b) = base {
+            let nearest = |layer: &Option<Layer>, t: DateTime<Utc>| {
+                layer.as_ref().and_then(|l| {
+                    let j = (0..l.frames()).min_by_key(|&j| (l.time(j) - t).num_seconds().abs())?;
+                    ((l.time(j) - t).num_minutes().abs() <= 5).then_some(j)
+                })
+            };
             for i in 0..b.frames() {
                 let t = b.time(i);
                 let observed = i < b.nowcast.observed.len();
-                let local_i = local.as_ref().map(|_| i);
-                // Europe's frame nearest in time, within 5 minutes.
-                let europe_i = europe.as_ref().and_then(|e| {
-                    let j = (0..e.frames()).min_by_key(|&j| (e.time(j) - t).num_seconds().abs())?;
-                    ((e.time(j) - t).num_minutes().abs() <= 5).then_some(j)
-                });
-                timeline.push((t, observed, local_i, europe_i));
+                timeline.push((t, observed, nearest(&local, t), nearest(&europe, t)));
             }
         }
         MapCanvas {
@@ -259,7 +265,8 @@ impl MapCanvas {
         let mut rgba = vec![0u8; w * h * 4];
         if let Some(&(_, _, local_i, europe_i)) = self.timeline.get(frame as usize) {
             let local = self.local.as_ref().zip(local_i).map(|(l, i)| (self.lookup(l), l.field(i)));
-            let europe = self.europe.as_ref().zip(europe_i).map(|(e, j)| (self.lookup(e), e.field(j)));
+            // Europe's grid even without a frame for this time: its area is then "no data".
+            let europe = self.europe.as_ref().map(|e| (self.lookup(e), europe_i.map(|j| e.field(j))));
             let no_data = premultiplied(radar_rgba(f32::NAN, dark));
             for k in 0..w * h {
                 let mut c = [0u8; 4];
@@ -276,7 +283,12 @@ impl MapCanvas {
                 }
                 if let Some((lut, f)) = &europe {
                     if lut[k] != NONE {
-                        c = premultiplied(radar_rgba(f.dbz(lut[k] as usize), dark));
+                        c = match f {
+                            Some(f) => premultiplied(radar_rgba(f.dbz(lut[k] as usize), dark)),
+                            None => no_data,
+                        };
+                    } else if on_local {
+                        c = no_data;
                     }
                 } else if on_local {
                     c = no_data;
@@ -369,21 +381,44 @@ mod tests {
 
     /// A KNMI-grid nowcast with rain (40 dBZ) in a box around a location.
     fn nowcast_with_rain_at(lat: f64, lon: f64) -> Nowcast {
+        nowcast_at(lat, lon, Utc::now(), 40.0)
+    }
+
+    /// The same, with the newest scan at `newest` and rain of `rain` dBZ.
+    fn nowcast_at(lat: f64, lon: f64, newest: DateTime<Utc>, rain: f32) -> Nowcast {
         let grid = Grid::knmi();
         let (c, r) = grid.to_pixel(lat, lon);
-        let now = Utc::now();
         let frames: Vec<Frame> = (0..3)
             .map(|k| {
                 let mut dbz = vec![0.0f32; grid.width * grid.height];
                 for y in (r as usize - 10)..(r as usize + 10) {
                     for x in (c as usize - 10)..(c as usize + 10) {
-                        dbz[y * grid.width + x] = 40.0;
+                        dbz[y * grid.width + x] = rain;
                     }
                 }
-                Frame { time: now - Duration::minutes(5 * k), grid, dbz, radars_up: vec![], radars_down: vec![], source: "KNMI" }
+                Frame { time: newest - Duration::minutes(5 * k), grid, dbz, radars_up: vec![], radars_down: vec![], source: "KNMI" }
             })
             .collect();
         Nowcast::compute(&frames, 4).unwrap()
+    }
+
+    #[test]
+    fn an_old_local_layer_doesnt_hold_back_the_map() {
+        let (lat, lon) = (52.09, 5.12);
+        let now = Utc::now();
+        // The local nowcast is an hour old (kept from another place); Europe's is new.
+        let local = Arc::new(nowcast_at(lat, lon, now - Duration::hours(1), 0.0));
+        let europe = Arc::new(nowcast_at(lat, lon, now, 40.0));
+        let canvas = MapCanvas::new(lat, lon, 8.0, 300, 200, 1.0, Some(local), Some(europe), None);
+        let latest = canvas.latest_frame();
+        assert_eq!(canvas.frames()[latest as usize].time, now.timestamp(), "the timeline follows Europe's newer scans");
+        let img = canvas.radar_image(latest, false);
+        assert_eq!(&img.rgba[(100 * 300 + 150) * 4..][..4], &premultiplied(radar_rgba(40.0, false)), "Europe's rain shows");
+        // A layer without a frame at that time reads as "no data", not as dry.
+        let only_local_then = MapCanvas::new(lat, lon, 8.0, 300, 200, 1.0, Some(Arc::new(nowcast_at(lat, lon, now, f32::NAN))),
+            Some(Arc::new(nowcast_at(lat, lon, now - Duration::hours(1), 0.0))), None);
+        let img = only_local_then.radar_image(only_local_then.latest_frame(), false);
+        assert_eq!(&img.rgba[(100 * 300 + 150) * 4..][..4], &premultiplied(radar_rgba(f32::NAN, false)));
     }
 
     #[test]

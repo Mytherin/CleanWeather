@@ -306,7 +306,9 @@ struct RadarMapView: View {
         }
     }
 
-    /// Make a canvas around the centre (in the background), then the rain of each frame.
+    /// Make a canvas around the centre and the rain of all its frames (in the background;
+    /// after the first, each frame is ~1 ms), then show them together, so playing or
+    /// scrubbing never reaches a frame that isn't drawn yet.
     private func redraw() async {
         let size = viewSize
         guard size.width > 0, size.height > 0 else { return }
@@ -318,30 +320,33 @@ struct RadarMapView: View {
         let (w, h) = (UInt32(size.width * (1 + 2 * Self.margin)), UInt32(size.height * (1 + 2 * Self.margin)))
         let (at, z) = (here, zoom)
         let pin = (store.location.lat, store.location.lon)
-        let latest = followLatest || drawn == nil
-        let keep = frame
-        let (next, first): (Drawn, (UInt32, CGImage?)) = await Task.detached(priority: .userInitiated) {
+        // A frame chosen on the slider stays at its time when new scans come.
+        let keepTime: Int64? = followLatest ? nil : drawn.flatMap { $0.frames.indices.contains(Int(frame)) ? $0.frames[Int(frame)].time : nil }
+        let (next, shown, images): (Drawn, UInt32, [UInt32: CGImage]) = await Task.detached(priority: .userInitiated) {
             let canvas = core.mapCanvas(centreLat: at.lat, centreLon: at.lon, zoom: z, width: w, height: h, scale: pixels)
             let frames = canvas.frames()
-            let shown = latest || Int(keep) >= frames.count ? canvas.latestFrame() : keep
+            var shown = canvas.latestFrame()
+            if let t = keepTime, let i = frames.indices.min(by: { abs(frames[$0].time - t) < abs(frames[$1].time - t) }) {
+                shown = UInt32(i)
+            }
             let d = Drawn(canvas: canvas, base: canvas.baseImage(dark: dark).cgImage(), lines: canvas.lines(),
                           labels: canvas.labels(pinLat: pin.0, pinLon: pin.1), frames: frames, zoom: z)
-            return (d, (shown, canvas.radarImage(frame: shown, dark: dark).cgImage()))
+            var images: [UInt32: CGImage] = [:]
+            for i in frames.indices.map({ UInt32($0) }) {
+                if let img = canvas.radarImage(frame: i, dark: dark).cgImage() {
+                    images[i] = img
+                }
+            }
+            return (d, shown, images)
         }.value
         guard gen == generation, !Task.isCancelled else { return }
         drawn = next
-        radar = [:]
-        radar[first.0] = first.1
-        frame = first.0
-        followLatest = first.0 == next.canvas.latestFrame()
-        // The other frames, nearest first, for the slider and playing.
-        let order = next.frames.indices.map { UInt32($0) }.filter { $0 != first.0 }
-            .sorted { abs(Int($0) - Int(first.0)) < abs(Int($1) - Int(first.0)) }
-        for i in order {
-            let canvas = next.canvas
-            let img = await Task.detached(priority: .utility) { canvas.radarImage(frame: i, dark: dark).cgImage() }.value
-            guard gen == generation, !Task.isCancelled else { return }
-            radar[i] = img
+        radar = images
+        frame = shown
+        followLatest = shown == next.canvas.latestFrame()
+        // A zoom or move made while this was drawing (e.g. before the first map came).
+        if next.zoom != zoom || (centre != nil && centre != at) {
+            await redrawIfNeeded()
         }
     }
 
