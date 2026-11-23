@@ -26,6 +26,7 @@ struct RadarMapView: View {
     @State private var playing = false
     @State private var drag: CGSize = .zero
     @State private var pinch: CGFloat = 1
+    @State private var pinchShift: CGSize = .zero
     @State private var viewSize: CGSize = .zero
     /// Bumped for every canvas requested, so a slow one doesn't replace a newer one.
     @State private var generation = 0
@@ -138,12 +139,17 @@ struct RadarMapView: View {
         CGFloat(pow(2, zoom - d.zoom)) * pinch
     }
 
+    /// How far a drag, and a pinch keeping the spot between the fingers in place, move the map.
+    private var shift: CGSize {
+        CGSize(width: drag.width + pinchShift.width, height: drag.height + pinchShift.height)
+    }
+
     private func transform(size: CGSize) -> Transform? {
         guard let d = drawn else { return nil }
-        // The view's centre on the canvas lands in the middle of the view (moved by a drag).
+        // The view's centre on the canvas lands in the middle of the view (moved by gestures).
         let c = d.canvas.project(lat: here.lat, lon: here.lon)
         let k = scale(d)
-        let mid = CGPoint(x: size.width / 2 + drag.width, y: size.height / 2 + drag.height)
+        let mid = CGPoint(x: size.width / 2 + shift.width, y: size.height / 2 + shift.height)
         return Transform(origin: CGPoint(x: mid.x - CGFloat(c.x) * k, y: mid.y - CGFloat(c.y) * k), k: k)
     }
 
@@ -152,8 +158,20 @@ struct RadarMapView: View {
         guard let d = drawn else { return nil }
         let k = scale(d)
         let c = d.canvas.project(lat: here.lat, lon: here.lon)
-        return d.canvas.location(x: c.x + Double((point.x - viewSize.width / 2 - drag.width) / k),
-                                 y: c.y + Double((point.y - viewSize.height / 2 - drag.height) / k))
+        return d.canvas.location(x: c.x + Double((point.x - viewSize.width / 2 - shift.width) / k),
+                                 y: c.y + Double((point.y - viewSize.height / 2 - shift.height) / k))
+    }
+
+    /// Make what the gestures did (moved, zoomed) the map's centre and zoom.
+    private func settleGestures() {
+        if let c = location(at: CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)) {
+            centre = c
+        }
+        zoom = clampZoom(zoom + log2(Double(pinch)))
+        drag = .zero
+        pinch = 1
+        pinchShift = .zero
+        Task { await redrawIfNeeded() }
     }
 
     private func drawLines(_ ctx: GraphicsContext, _ d: Drawn, _ t: Transform) {
@@ -251,13 +269,8 @@ struct RadarMapView: View {
         DragGesture(minimumDistance: 4)
             .onChanged { drag = $0.translation }
             .onEnded { _ in
-                // The point now in the middle of the view becomes the centre.
-                let mid = CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)
-                if let c = location(at: mid) {
-                    centre = c
-                }
-                drag = .zero
-                Task { await redrawIfNeeded() }
+                // While a pinch goes on, it settles both when it ends.
+                if pinch == 1 { settleGestures() }
             }
     }
 
@@ -266,13 +279,12 @@ struct RadarMapView: View {
             .onChanged { v in
                 let z = clampZoom(zoom + log2(Double(v.magnification)))
                 pinch = CGFloat(pow(2, z - zoom))
+                // Keep the spot where the pinch started under the fingers.
+                let ax = v.startLocation.x - viewSize.width / 2 - drag.width
+                let ay = v.startLocation.y - viewSize.height / 2 - drag.height
+                pinchShift = CGSize(width: ax * (1 - pinch), height: ay * (1 - pinch))
             }
-            .onEnded { _ in
-                centre = here
-                zoom = clampZoom(zoom + log2(Double(pinch)))
-                pinch = 1
-                Task { await redrawIfNeeded() }
-            }
+            .onEnded { _ in settleGestures() }
     }
 
     private func clampZoom(_ z: Double) -> Double {
