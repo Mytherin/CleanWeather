@@ -127,6 +127,15 @@ pub struct RainReport {
     pub radars_down: Vec<String>,
 }
 
+/// What a radar refresh brought.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct RadarRefresh {
+    /// Something new to show: the location's nowcast, or Europe's rain for the map.
+    pub changed: bool,
+    /// Why no radar works for the location, if none does.
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 struct Latest {
     nowcast: Option<Arc<Nowcast>>,
@@ -175,9 +184,10 @@ impl WeatherCore {
     }
 
     /// Check the radars for new scans at a location, and Europe's for the map
-    /// (blocking, ~1–3 s). True if there's something new to show. Fails only when
-    /// no radar works for the location; the map's Europe layer failing is ignored.
-    pub fn refresh_radar(&self, lat: f64, lon: f64) -> Result<bool, WeatherError> {
+    /// (blocking, ~1–3 s). The error is when no radar works for the location; the
+    /// map's Europe layer failing is ignored, and it still updates when the
+    /// location's radar fails.
+    pub fn refresh_radar(&self, lat: f64, lon: f64) -> RadarRefresh {
         let local = lock(&self.service).update(lat, lon);
         let europe = lock(&self.europe).update();
         let mut latest = lock(&self.latest);
@@ -186,16 +196,18 @@ impl WeatherCore {
             latest.europe = Some(Arc::new(nc));
             changed = true;
         }
-        match local {
+        let error = match local {
             Ok(Some(u)) => {
                 latest.nowcast = Some(Arc::new(u.nowcast));
                 latest.source = Some(u.source);
                 latest.fallback = u.fallback_reason;
-                Ok(true)
+                changed = true;
+                None
             }
-            Ok(None) => Ok(changed),
-            Err(e) => Err(failed(e)),
-        }
+            Ok(None) => None,
+            Err(e) => Some(format!("{e:#}")),
+        };
+        RadarRefresh { changed, error }
     }
 
     /// The nowcast at a location, once a refresh has made one.

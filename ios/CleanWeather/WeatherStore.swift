@@ -79,18 +79,16 @@ final class WeatherStore: ObservableObject {
         let loc = location
         let core = self.core
         let radar = await Task.detached(priority: .userInitiated) {
-            Result(catching: { try core.refreshRadar(lat: loc.lat, lon: loc.lon) })
+            core.refreshRadar(lat: loc.lat, lon: loc.lon)
         }.value
-        // The location may have changed meanwhile: show the rain where it is now.
-        rain = core.rain(lat: location.lat, lon: location.lon)
+        // The location may have changed meanwhile: show the rain where it is now. If no
+        // radar works there, an old nowcast's "no coverage" would hide the reason why.
+        let here = core.rain(lat: location.lat, lon: location.lon)
+        rain = radar.error != nil && here?.outlook == .noData ? nil : here
         lastCheck = Date()
-        switch radar {
-        case .success(let changed):
-            radarError = nil
-            if changed { radarVersion += 1 }
-        case .failure(let e):
-            radarError = Self.message(e)
-        }
+        radarError = radar.error
+        // Also when only Europe's rain changed (the map), even if the location's radar failed.
+        if radar.changed { radarVersion += 1 }
         await refreshForecastIfDue()
     }
 
@@ -162,8 +160,12 @@ final class WeatherStore: ObservableObject {
     func setKeys(knmi: String, meteogate: String) {
         Keychain.set(.knmi, knmi)
         Keychain.set(.meteogate, meteogate)
-        core.setKeys(knmiKey: Keychain.get(.knmi), meteogateKey: Keychain.get(.meteogate))
-        Task { await refresh() }
+        let (core, k, m) = (self.core, Keychain.get(.knmi), Keychain.get(.meteogate))
+        Task {
+            // Off the main thread: it waits for a refresh in progress to finish.
+            await Task.detached { core.setKeys(knmiKey: k, meteogateKey: m) }.value
+            await refresh()
+        }
     }
 
     // MARK: Helpers
