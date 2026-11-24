@@ -130,7 +130,7 @@ pub struct RainReport {
 /// What a radar refresh brought.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct RadarRefresh {
-    /// Something new to show: the location's nowcast, or Europe's rain for the map.
+    /// A new nowcast for the location (or an old one dropped).
     pub changed: bool,
     /// Why no radar works for the location, if none does.
     pub error: Option<String>,
@@ -185,19 +185,45 @@ impl WeatherCore {
         *lock(&self.europe) = Europe::new(mg, self.cache_dir.clone());
     }
 
-    /// Check the radars for new scans at a location, and Europe's for the map
-    /// (blocking, ~1–3 s). The error is when no radar works for the location; the
-    /// map's Europe layer failing is ignored, and it still updates when the
-    /// location's radar fails.
-    pub fn refresh_radar(&self, lat: f64, lon: f64) -> RadarRefresh {
-        self.refresh(lat, lon, true)
+    /// Check the radars for new scans at a location (blocking, ~0.5–1 s); the error
+    /// is when no radar works for it. Europe's rain for the map is
+    /// [`refresh_europe`](Self::refresh_europe), so the headline needn't wait for
+    /// the map.
+    pub fn refresh_rain(&self, lat: f64, lon: f64) -> RadarRefresh {
+        let local = lock(&self.service).update(lat, lon);
+        let mut latest = lock(&self.latest);
+        let mut changed = false;
+        let error = match local {
+            Ok(Some(u)) => {
+                latest.nowcast = Some(Arc::new(u.nowcast));
+                latest.at = Some((lat, lon));
+                latest.source = Some(u.source);
+                latest.fallback = u.fallback_reason;
+                changed = true;
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                // A nowcast for somewhere else (cropped around that place, ever older)
+                // would only mislead here: drop it. At the same place, keep it; the app
+                // shows its age.
+                if latest.at.is_some_and(|(a, b)| (a - lat).abs() > 0.005 || (b - lon).abs() > 0.005) {
+                    *latest = Latest { europe: latest.europe.take(), ..Latest::default() };
+                    changed = true;
+                }
+                Some(format!("{e:#}"))
+            }
+        };
+        RadarRefresh { changed, error }
     }
 
-    /// Like [`refresh_radar`](Self::refresh_radar), but only the location's radar,
-    /// not Europe's for the map: for a background refresh (the widget), which has
-    /// little time and no map to show.
-    pub fn refresh_rain(&self, lat: f64, lon: f64) -> RadarRefresh {
-        self.refresh(lat, lon, false)
+    /// Check for a new Europe-wide scan for the map (blocking, ~0.5–1 s); true when
+    /// there is one. It runs alongside [`refresh_rain`](Self::refresh_rain) (each
+    /// has its own lock), and a failure is ignored: the map keeps the rain it has.
+    pub fn refresh_europe(&self) -> bool {
+        let Ok(Some(nc)) = lock(&self.europe).update() else { return false };
+        lock(&self.latest).europe = Some(Arc::new(nc));
+        true
     }
 
     /// The nowcast at a location, once a refresh has made one.
@@ -238,41 +264,6 @@ impl WeatherCore {
             latest.europe.clone(),
             latest.source.map(attribution),
         ))
-    }
-}
-
-impl WeatherCore {
-    fn refresh(&self, lat: f64, lon: f64, with_europe: bool) -> RadarRefresh {
-        let local = lock(&self.service).update(lat, lon);
-        let europe = if with_europe { lock(&self.europe).update() } else { Ok(None) };
-        let mut latest = lock(&self.latest);
-        let mut changed = false;
-        if let Ok(Some(nc)) = europe {
-            latest.europe = Some(Arc::new(nc));
-            changed = true;
-        }
-        let error = match local {
-            Ok(Some(u)) => {
-                latest.nowcast = Some(Arc::new(u.nowcast));
-                latest.at = Some((lat, lon));
-                latest.source = Some(u.source);
-                latest.fallback = u.fallback_reason;
-                changed = true;
-                None
-            }
-            Ok(None) => None,
-            Err(e) => {
-                // A nowcast for somewhere else (cropped around that place, ever older)
-                // would only mislead here: drop it. At the same place, keep it; the app
-                // shows its age.
-                if latest.at.is_some_and(|(a, b)| (a - lat).abs() > 0.005 || (b - lon).abs() > 0.005) {
-                    *latest = Latest { europe: latest.europe.take(), ..Latest::default() };
-                    changed = true;
-                }
-                Some(format!("{e:#}"))
-            }
-        };
-        RadarRefresh { changed, error }
     }
 }
 

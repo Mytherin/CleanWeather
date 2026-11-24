@@ -46,6 +46,8 @@ final class WeatherStore: ObservableObject {
         try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
         core = WeatherCore(cacheDir: caches.path, knmiKey: Keychain.get(.knmi), meteogateKey: Keychain.get(.meteogate))
         location = Self.savedLocation() ?? .amsterdam
+        // Opened again soon after: show the last nowcast while the radar is checked.
+        rain = SavedRain.load(for: location)
     }
 
     // MARK: Refreshing
@@ -78,12 +80,15 @@ final class WeatherStore: ObservableObject {
         }
         let loc = location
         let core = self.core
+        // Europe's rain for the map alongside: the headline doesn't wait for it.
+        let europe = Task.detached(priority: .utility) { core.refreshEurope() }
         let radar = await Task.detached(priority: .userInitiated) {
-            core.refreshRadar(lat: loc.lat, lon: loc.lon)
+            core.refreshRain(lat: loc.lat, lon: loc.lon)
         }.value
         // The place changed meanwhile: its own refresh will show it; only redraw the map.
         guard loc == location else {
             if radar.changed { radarVersion += 1 }
+            if await europe.value { radarVersion += 1 }
             return
         }
         // If no radar works here, an old nowcast's "no coverage" would hide the reason why.
@@ -92,9 +97,12 @@ final class WeatherStore: ObservableObject {
         lastCheck = Date()
         radarError = radar.error
         publishWidget()
-        // Also when only Europe's rain changed (the map), even if the location's radar failed.
         if radar.changed { radarVersion += 1 }
-        await refreshForecastIfDue()
+        // The week ahead while Europe's rain is still coming.
+        async let forecast: Void = refreshForecastIfDue()
+        // Europe's rain updates the map even if the location's radar failed.
+        if await europe.value { radarVersion += 1 }
+        await forecast
     }
 
     private func refreshForecastIfDue() async {
@@ -148,7 +156,8 @@ final class WeatherStore: ObservableObject {
     /// What the widget last got: a new scan or a new place, or a new reason for none.
     private var published: RainSnapshot?
 
-    /// Give the widget the nowcast, when there's something new for it.
+    /// Give the widget the nowcast when there's something new for it, and save a new
+    /// one for the next time the app opens.
     private func publishWidget() {
         let snapshot: RainSnapshot
         if let rain {
@@ -159,6 +168,9 @@ final class WeatherStore: ObservableObject {
         guard snapshot != published else { return }
         published = snapshot
         snapshot.publish()
+        if let rain {
+            SavedRain(location: location, report: rain).save()
+        }
     }
 
     // MARK: Location
@@ -233,7 +245,7 @@ final class WeatherStore: ObservableObject {
     }
 
     /// More than ~500 m apart (as the desktop app counts a move).
-    static func moved(from a: (Double, Double), to b: WeatherLocation) -> Bool {
+    nonisolated static func moved(from a: (Double, Double), to b: WeatherLocation) -> Bool {
         abs(a.0 - b.lat) > 0.005 || abs(a.1 - b.lon) > 0.005
     }
 

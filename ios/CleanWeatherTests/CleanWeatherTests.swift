@@ -28,6 +28,23 @@ final class CleanWeatherTests: XCTestCase {
         XCTAssertEqual(s.end, Format.date(t0 + 1200))
     }
 
+    func testSavedRainRoundTripAndFreshness() throws {
+        let t0: Int64 = 1_800_000_000
+        let rates: [Float?] = [0, 0, 0, 1.5, nil]
+        let samples = rates.enumerated().map { i, mm in
+            RainSample(time: t0 + Int64(i - 1) * 300, mmPerHour: mm, chance: 0.25, observed: i <= 1)
+        }
+        let report = RainReport(issued: t0, samples: samples, outlook: .rainFrom(at: t0 + 600, peak: 1.5),
+                                motion: RainMotion(kmh: 30, towards: "NE"), source: "KNMI", attribution: "KNMI (CC BY 4.0)",
+                                fallbackReason: nil, radarsDown: ["Herwijnen"])
+        let saved = try JSONDecoder().decode(SavedRain.self, from: JSONEncoder().encode(SavedRain(location: .amsterdam, report: report)))
+        XCTAssertEqual(saved.report, report, "the outlook comes back from the samples")
+        let at = { (minutes: Int64) in Format.date(t0 + minutes * 60) }
+        XCTAssertTrue(saved.usable(for: .amsterdam, now: at(14)))
+        XCTAssertFalse(saved.usable(for: .amsterdam, now: at(16)), "too old")
+        XCTAssertFalse(saved.usable(for: WeatherLocation(name: "Utrecht", lat: 52.09, lon: 5.12, followsDevice: false), now: at(1)), "elsewhere")
+    }
+
     func testDegreesAndDays() {
         XCTAssertEqual(Format.degrees(-0.4), "0°")
         XCTAssertEqual(Format.degrees(6.6), "7°")
