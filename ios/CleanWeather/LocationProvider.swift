@@ -24,6 +24,13 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         manager.desiredAccuracy = kCLLocationAccuracyKilometer
     }
 
+    /// The last fix iOS has, if it's from the last hour (for a background refresh,
+    /// which can't ask for a new one).
+    var lastKnown: CLLocation? {
+        guard let last = manager.location, -last.timestamp.timeIntervalSinceNow < 3600 else { return nil }
+        return last
+    }
+
     func current() async throws -> CLLocation {
         // A recent fix is good enough.
         if let last = manager.location, -last.timestamp.timeIntervalSinceNow < 120 {

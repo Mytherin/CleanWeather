@@ -91,6 +91,7 @@ final class WeatherStore: ObservableObject {
         rain = radar.error != nil && here?.outlook == .noData ? nil : here
         lastCheck = Date()
         radarError = radar.error
+        publishWidget()
         // Also when only Europe's rain changed (the map), even if the location's radar failed.
         if radar.changed { radarVersion += 1 }
         await refreshForecastIfDue()
@@ -116,6 +117,50 @@ final class WeatherStore: ObservableObject {
         }
     }
 
+    // MARK: The widget
+
+    /// A refresh while the app isn't open, for the widget (iOS decides when, from
+    /// how often the app is used): only the location's radar, not the map's.
+    func backgroundRefresh() async {
+        if location.followsDevice, let here = locator.lastKnown {
+            let (lat, lon) = (here.coordinate.latitude, here.coordinate.longitude)
+            let loc = WeatherLocation(name: placeName(lat: lat, lon: lon), lat: lat, lon: lon, followsDevice: true)
+            if Self.moved(from: (location.lat, location.lon), to: loc) {
+                location = loc
+                Self.save(loc)
+                rain = nil
+                week = nil
+                forecastFetched = nil
+            }
+        }
+        let loc = location
+        let core = self.core
+        let radar = await Task.detached(priority: .utility) {
+            core.refreshRain(lat: loc.lat, lon: loc.lon)
+        }.value
+        guard loc == location else { return }
+        let here = core.rain(lat: loc.lat, lon: loc.lon)
+        rain = radar.error != nil && here?.outlook == .noData ? nil : here
+        radarError = radar.error
+        publishWidget()
+    }
+
+    /// What the widget last got: a new scan or a new place, or a new reason for none.
+    private var published: RainSnapshot?
+
+    /// Give the widget the nowcast, when there's something new for it.
+    private func publishWidget() {
+        let snapshot: RainSnapshot
+        if let rain {
+            snapshot = RainSnapshot(location: location, report: rain)
+        } else {
+            snapshot = RainSnapshot(location: location, message: radarError ?? "Getting the radar…")
+        }
+        guard snapshot != published else { return }
+        published = snapshot
+        snapshot.publish()
+    }
+
     // MARK: Location
 
     /// Forecast for another place, and remember it for next time.
@@ -123,14 +168,14 @@ final class WeatherStore: ObservableObject {
         let moved = Self.moved(from: (location.lat, location.lon), to: loc)
         location = loc
         locationError = nil
-        if let data = try? JSONEncoder().encode(loc) {
-            UserDefaults.standard.set(data, forKey: "location")
-        }
+        Self.save(loc)
         guard moved else { return }
         // The current nowcast may already cover the new place; if it doesn't, show that
         // the radar is coming rather than "no coverage" until the refresh is done.
         let here = core.rain(lat: loc.lat, lon: loc.lon)
         rain = here?.outlook == .noData ? nil : here
+        radarError = nil
+        publishWidget()
         week = nil
         forecastFetched = nil
         Task { await refresh() }
@@ -175,6 +220,12 @@ final class WeatherStore: ObservableObject {
     }
 
     // MARK: Helpers
+
+    private static func save(_ loc: WeatherLocation) {
+        if let data = try? JSONEncoder().encode(loc) {
+            UserDefaults.standard.set(data, forKey: "location")
+        }
+    }
 
     private static func savedLocation() -> WeatherLocation? {
         guard let data = UserDefaults.standard.data(forKey: "location") else { return nil }

@@ -190,36 +190,14 @@ impl WeatherCore {
     /// map's Europe layer failing is ignored, and it still updates when the
     /// location's radar fails.
     pub fn refresh_radar(&self, lat: f64, lon: f64) -> RadarRefresh {
-        let local = lock(&self.service).update(lat, lon);
-        let europe = lock(&self.europe).update();
-        let mut latest = lock(&self.latest);
-        let mut changed = false;
-        if let Ok(Some(nc)) = europe {
-            latest.europe = Some(Arc::new(nc));
-            changed = true;
-        }
-        let error = match local {
-            Ok(Some(u)) => {
-                latest.nowcast = Some(Arc::new(u.nowcast));
-                latest.at = Some((lat, lon));
-                latest.source = Some(u.source);
-                latest.fallback = u.fallback_reason;
-                changed = true;
-                None
-            }
-            Ok(None) => None,
-            Err(e) => {
-                // A nowcast for somewhere else (cropped around that place, ever older)
-                // would only mislead here: drop it. At the same place, keep it; the app
-                // shows its age.
-                if latest.at.is_some_and(|(a, b)| (a - lat).abs() > 0.005 || (b - lon).abs() > 0.005) {
-                    *latest = Latest { europe: latest.europe.take(), ..Latest::default() };
-                    changed = true;
-                }
-                Some(format!("{e:#}"))
-            }
-        };
-        RadarRefresh { changed, error }
+        self.refresh(lat, lon, true)
+    }
+
+    /// Like [`refresh_radar`](Self::refresh_radar), but only the location's radar,
+    /// not Europe's for the map: for a background refresh (the widget), which has
+    /// little time and no map to show.
+    pub fn refresh_rain(&self, lat: f64, lon: f64) -> RadarRefresh {
+        self.refresh(lat, lon, false)
     }
 
     /// The nowcast at a location, once a refresh has made one.
@@ -260,6 +238,41 @@ impl WeatherCore {
             latest.europe.clone(),
             latest.source.map(attribution),
         ))
+    }
+}
+
+impl WeatherCore {
+    fn refresh(&self, lat: f64, lon: f64, with_europe: bool) -> RadarRefresh {
+        let local = lock(&self.service).update(lat, lon);
+        let europe = if with_europe { lock(&self.europe).update() } else { Ok(None) };
+        let mut latest = lock(&self.latest);
+        let mut changed = false;
+        if let Ok(Some(nc)) = europe {
+            latest.europe = Some(Arc::new(nc));
+            changed = true;
+        }
+        let error = match local {
+            Ok(Some(u)) => {
+                latest.nowcast = Some(Arc::new(u.nowcast));
+                latest.at = Some((lat, lon));
+                latest.source = Some(u.source);
+                latest.fallback = u.fallback_reason;
+                changed = true;
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                // A nowcast for somewhere else (cropped around that place, ever older)
+                // would only mislead here: drop it. At the same place, keep it; the app
+                // shows its age.
+                if latest.at.is_some_and(|(a, b)| (a - lat).abs() > 0.005 || (b - lon).abs() > 0.005) {
+                    *latest = Latest { europe: latest.europe.take(), ..Latest::default() };
+                    changed = true;
+                }
+                Some(format!("{e:#}"))
+            }
+        };
+        RadarRefresh { changed, error }
     }
 }
 
@@ -398,6 +411,20 @@ pub fn intensity_label(mm_per_hour: f32) -> String {
 
 /// The rain graph's height for a rate (0–1): logarithmic, so 0.1 mm/h drizzle shows
 /// (~12%) while 1, 5 and 20 mm/h sit at ~40%, ~70% and ~95%.
+/// The outlook as it will read at `now`, a time within the report: the samples up to
+/// then count as the past. For the widget, which shows the forecast ahead of time.
+#[uniffi::export]
+pub fn outlook_at(samples: Vec<RainSample>, now: i64) -> RainOutlook {
+    let samples: Vec<nowcast::Sample> = samples
+        .iter()
+        .filter_map(|s| {
+            let time = DateTime::from_timestamp(s.time, 0)?;
+            Some(nowcast::Sample { time, mm_per_hour: s.mm_per_hour, chance: s.chance, observed: s.time <= now })
+        })
+        .collect();
+    nowcast::outlook(&samples).into()
+}
+
 #[uniffi::export]
 pub fn rain_axis(mm_per_hour: f32) -> f32 {
     ((1.0 + mm_per_hour.max(0.0) * 10.0).ln() / (1.0 + 30.0 * 10.0f32).ln()).min(1.0)
@@ -434,6 +461,17 @@ mod tests {
         let t = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         assert_eq!(RainOutlook::from(Outlook::RainFrom { at: t, peak: 2.0 }), RainOutlook::RainFrom { at: 1_800_000_000, peak: 2.0 });
         assert_eq!(RainOutlook::from(Outlook::Raining { until: None, peak: 1.0 }), RainOutlook::Raining { until: None, peak: 1.0 });
+    }
+
+    #[test]
+    fn outlook_later_on() {
+        let t0 = 1_800_000_000;
+        let sample = |k: i64, mm: f32| RainSample { time: t0 + k * 300, mm_per_hour: Some(mm), chance: 0.0, observed: k <= 0 };
+        // Dry now, rain from +15 min to +25 min.
+        let samples: Vec<_> = (0..8).map(|k| sample(k, if (3..5).contains(&k) { 2.0 } else { 0.0 })).collect();
+        assert_eq!(outlook_at(samples.clone(), t0), RainOutlook::RainFrom { at: t0 + 900, peak: 2.0 });
+        assert_eq!(outlook_at(samples.clone(), t0 + 900), RainOutlook::Raining { until: Some(t0 + 1500), peak: 2.0 });
+        assert_eq!(outlook_at(samples, t0 + 1500), RainOutlook::Dry { until: t0 + 2100 });
     }
 
     #[test]

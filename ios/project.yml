@@ -24,10 +24,31 @@ targets:
         - CleanWeatherTests
     sources:
       - path: CleanWeather
+      - path: Shared
       - path: Generated/cleanweather_ffi.swift
         optional: true
         createIntermediateGroups: true
+    # The widget reads the rain forecast the app saves in the App Group, which a
+    # background refresh keeps up to date while the app isn't open.
+    entitlements:
+      path: CleanWeather/CleanWeather.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.cleanweather.CleanWeather
+    # So automatic signing enables App Groups on the App ID.
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups.iOS:
+          enabled: 1
+    info:
+      path: CleanWeather/Info.plist
+      properties:
+        UIBackgroundModes: [fetch]
+        BGTaskSchedulerPermittedIdentifiers: [com.cleanweather.CleanWeather.refresh]
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
     dependencies:
+      - target: CleanWeatherWidget
       - framework: build/CleanWeatherCore.xcframework
         embed: false
         link: true
@@ -51,7 +72,7 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Weather
+        INFOPLIST_KEY_CFBundleDisplayName: Rain
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
@@ -62,6 +83,45 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+  # The Home Screen widget: draws what the app saved (it can't run the nowcast
+  # itself in a widget's memory), so it doesn't link the Rust core.
+  CleanWeatherWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CleanWeatherWidget
+      - path: Shared
+    entitlements:
+      path: CleanWeatherWidget/CleanWeatherWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.cleanweather.CleanWeather
+    # So automatic signing enables App Groups on the App ID.
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups.iOS:
+          enabled: 1
+    info:
+      path: CleanWeatherWidget/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cleanweather.CleanWeather.Widget
+        PRODUCT_NAME: CleanWeatherWidget
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Rain
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Automatic
   # Unit tests of the app's Swift (the headline and formatting) against the Rust
   # core, run in the app on the iOS Simulator:

@@ -13,6 +13,21 @@ final class CleanWeatherTests: XCTestCase {
         XCTAssertEqual(Format.headline(.noData, now: now), "No radar coverage here")
     }
 
+    func testWidgetSnapshotHeadlinesAhead() {
+        let t0: Int64 = 1_800_000_000
+        // Dry at the newest scan, light rain from +10 to +20 min.
+        let samples = (-1...4).map { k in
+            RainSample(time: t0 + Int64(k) * 300, mmPerHour: (2...3).contains(k) ? Float(0.5) : 0, chance: 0, observed: k <= 0)
+        }
+        let report = RainReport(issued: t0, samples: samples, outlook: .rainFrom(at: t0 + 600, peak: 0.5), motion: nil,
+                                source: "KNMI", attribution: "", fallbackReason: nil, radarsDown: [])
+        let s = RainSnapshot(location: .amsterdam, report: report)
+        XCTAssertEqual(s.points.count, 6)
+        XCTAssertEqual(s.headlines.map(\.kind), [RainSnapshot.Kind]([.rainSoon, .rainSoon, .raining, .raining, .dry]))
+        XCTAssertEqual(s.headline(at: Format.date(t0 + 400))?.text, "Light rain in 5 min (\(Format.time(t0 + 600)))")
+        XCTAssertEqual(s.end, Format.date(t0 + 1200))
+    }
+
     func testDegreesAndDays() {
         XCTAssertEqual(Format.degrees(-0.4), "0°")
         XCTAssertEqual(Format.degrees(6.6), "7°")
