@@ -10,8 +10,9 @@
 //! - it has no radar data at the location (outside its coverage, or radars down), or
 //! - it has fewer than two scans (no motion to estimate).
 //!
-//! A source that failed is skipped for [`RETRY_MINUTES`], then tried again, so the app
-//! returns to the preferred source by itself once it works again.
+//! A source that failed is skipped for [`RETRY_MINUTES`] (or until the location moves),
+//! then tried again, so the app returns to the preferred source by itself once it works
+//! again.
 
 use crate::knmi::Client;
 use crate::nowcast::{DEFAULT_STEPS, Nowcast};
@@ -122,8 +123,9 @@ pub struct Update {
 
 pub struct Service {
     sources: Vec<Box<dyn RadarSource>>,
-    /// Per source: don't try before this time (after a failure), and why it failed.
-    skip_until: Vec<Option<(DateTime<Utc>, String)>>,
+    /// Per source: don't try before this time (after a failure), why it failed, and at
+    /// which location (a failure such as "no radar data here" says nothing about another).
+    skip_until: Vec<Option<(DateTime<Utc>, String, (f64, f64))>>,
     /// What the last nowcast was made from: source, newest scan, location.
     last: Option<(&'static str, DateTime<Utc>, (f64, f64))>,
 }
@@ -157,8 +159,8 @@ impl Service {
         order.sort_by_key(|&i| !self.sources[i].preferred(lat, lon));
         for i in order {
             let name = self.sources[i].name();
-            if let Some((until, why)) = &self.skip_until[i] {
-                if now < *until {
+            if let Some((until, why, at)) = &self.skip_until[i] {
+                if now < *until && *at == (lat, lon) {
                     reasons.push(format!("{name}: {why}"));
                     continue;
                 }
@@ -169,7 +171,7 @@ impl Service {
                 Err(e) => {
                     let why = format!("{e:#}");
                     reasons.push(format!("{name}: {why}"));
-                    self.skip_until[i] = Some((now + Duration::minutes(RETRY_MINUTES), why));
+                    self.skip_until[i] = Some((now + Duration::minutes(RETRY_MINUTES), why, (lat, lon)));
                     continue;
                 }
             };
@@ -360,6 +362,38 @@ mod tests {
         let u = s.update_at(AMS.0, AMS.1, now + Duration::minutes(RETRY_MINUTES + 1)).unwrap().unwrap();
         assert_eq!(u.source, "OPERA");
         assert!(u.fallback_reason.is_none());
+    }
+
+    /// A source with data only south of a latitude (like OPERA, which has no Italian radars
+    /// but covers France).
+    struct GapSource {
+        now: DateTime<Utc>,
+        data_north_of: f64,
+    }
+
+    impl RadarSource for GapSource {
+        fn name(&self) -> &'static str {
+            "OPERA"
+        }
+        fn latest(&mut self, lat: f64, _: f64, _: usize) -> Result<Vec<Frame>> {
+            let grid = Grid::knmi();
+            let value = if lat > self.data_north_of { 0.0 } else { f32::NAN };
+            Ok((0..3)
+                .map(|k| Frame { time: self.now - Duration::minutes(5 + 5 * k), grid, dbz: vec![value; grid.width * grid.height], radars_up: vec![], radars_down: vec![], source: "OPERA" })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn moving_away_from_a_gap_uses_the_source_again() {
+        // No data at the first location, so the only source is set aside; after moving to
+        // a location it does cover, it must be asked again rather than skipped for
+        // RETRY_MINUTES with the old location's reason.
+        let now = Utc::now();
+        let mut s = Service::with_sources(vec![Box::new(GapSource { now, data_north_of: 52.0 })]);
+        assert!(s.update_at(51.0, 5.0, now).is_err(), "no data at the first location");
+        let u = s.update_at(AMS.0, AMS.1, now + Duration::minutes(1));
+        assert!(u.is_ok(), "the source has data at the new location: {:#}", u.err().unwrap());
     }
 
     #[test]

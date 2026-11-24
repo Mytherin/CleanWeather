@@ -76,7 +76,7 @@ pub struct App {
     last_tick: Instant,
     /// Textures per map frame, for the nowcast issued at `textures_for`.
     textures: Vec<Option<TextureHandle>>,
-    textures_for: Option<(DateTime<Utc>, bool)>,
+    textures_for: Option<TextureKey>,
     /// Textures of the Europe-wide frames, for (nowcast, dark mode, coverage mask).
     europe_textures: Vec<Option<TextureHandle>>,
     europe_textures_for: Option<(DateTime<Utc>, bool, usize)>,
@@ -244,6 +244,15 @@ fn fold(s: &str) -> String {
         out.push_str(base);
     }
     out
+}
+
+/// What the map's radar textures were made for: the textures are rebuilt when it changes.
+/// A move can give a nowcast for the same scan on another grid (another OPERA square,
+/// or KNMI ↔ OPERA), with another number of scans.
+type TextureKey = (DateTime<Utc>, cleanweather_core::radar::Grid, usize, bool);
+
+fn texture_key(nc: &Nowcast, dark: bool) -> TextureKey {
+    (nc.issued, nc.grid, nc.observed.len() + nc.forecast.len(), dark)
 }
 
 fn local(t: DateTime<Utc>) -> String {
@@ -540,12 +549,12 @@ impl App {
         let pal = Palette::new(ui);
         let frames = Self::map_frames(nc);
         let latest = nc.observed.len() - 1;
-        if self.textures_for != Some((nc.issued, pal.dark)) {
+        if self.textures_for != Some(texture_key(nc, pal.dark)) {
             self.textures = vec![None; frames.len()];
             if self.textures_for.map(|t| t.0) != Some(nc.issued) {
                 self.frame = latest;
             }
-            self.textures_for = Some((nc.issued, pal.dark));
+            self.textures_for = Some(texture_key(nc, pal.dark));
         }
         self.frame = self.frame.min(frames.len() - 1);
 
@@ -990,5 +999,31 @@ mod tests {
             last = y;
         }
         assert_eq!(rate_y(100.0), 1.0);
+    }
+
+    fn nowcast_at(lat: f64, lon: f64, scans: usize) -> Nowcast {
+        use cleanweather_core::opera::{Product, crop_for};
+        use cleanweather_core::radar::Frame;
+        let grid = crop_for(lat, lon, Product::MaxReflectivity).unwrap();
+        let issued = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let frames: Vec<Frame> = (0..scans)
+            .map(|k| Frame { time: issued - chrono::Duration::minutes(5 * k as i64), grid, dbz: vec![0.0; grid.width * grid.height], radars_up: vec![], radars_down: vec![], source: "OPERA" })
+            .collect();
+        Nowcast::compute(&frames, 1).unwrap()
+    }
+
+    #[test]
+    fn map_textures_follow_a_move_within_one_scan() {
+        // Moving from Paris to Berlin (or Amsterdam to Brussels, KNMI to OPERA) usually
+        // gives a nowcast for the same scan time on another grid, sometimes with another
+        // number of scans. The cached textures must not be reused for it: they'd show
+        // Paris's rain over Berlin, or index past the end of the texture list.
+        let paris = nowcast_at(48.86, 2.35, 7);
+        let berlin = nowcast_at(52.52, 13.40, 7);
+        let fewer = nowcast_at(48.86, 2.35, 6);
+        assert_eq!(paris.issued, berlin.issued);
+        assert_ne!(texture_key(&paris, false), texture_key(&berlin, false));
+        assert_ne!(texture_key(&paris, false), texture_key(&fewer, false));
+        assert_eq!(texture_key(&paris, true), texture_key(&nowcast_at(48.86, 2.35, 7), true));
     }
 }

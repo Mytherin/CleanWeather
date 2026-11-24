@@ -277,6 +277,10 @@ impl Opera {
         let mut bytes = self.range(&id, 0, 16 * 1024)?;
         let cog = match parse_cog(&bytes, self.product) {
             Ok(c) => c,
+            // NeedMore(0): not a TIFF, or not the layout this decodes. A larger read won't
+            // help, and an index bigger than ~1 MB isn't OPERA's.
+            Err(NeedMore(0)) => bail!("{key} is not a GeoTIFF in the expected format"),
+            Err(NeedMore(n)) if n > 1 << 20 => bail!("{key}: TIFF index too large ({n} bytes)"),
             Err(NeedMore(n)) => {
                 bytes = self.range(&id, 0, n)?;
                 parse_cog(&bytes, self.product).map_err(|_| anyhow!("unreadable TIFF index"))?
@@ -292,6 +296,9 @@ impl Opera {
     }
 
     fn range(&self, url: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new()); // "bytes=start-(start-1)" would be invalid
+        }
         let r = self
             .agent
             .get(url)
@@ -551,5 +558,162 @@ mod tests {
     #[test]
     fn rejects_non_tiff() {
         assert!(parse_cog(b"not a tiff at all", Product::MaxReflectivity).is_err());
+    }
+
+    /// Serve `body` over HTTP on localhost, honouring `Range` requests; returns the base URL.
+    fn serve(body: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (Ok(mut stream), body) = (stream, body.clone()) else { continue };
+                std::thread::spawn(move || {
+                    let mut range = None;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                            let (a, b) = r.trim().split_once('-').unwrap();
+                            range = Some((a.parse::<usize>().unwrap(), b.parse::<u64>().unwrap()));
+                        }
+                    }
+                    let (status, part) = match range {
+                        Some((a, b)) => ("206 Partial Content", &body[a.min(body.len())..(b.saturating_add(1).min(body.len() as u64) as usize).max(a.min(body.len()))]),
+                        None => ("200 OK", &body[..]),
+                    };
+                    let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+                    let _ = stream.write_all(part);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn temp_cache(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cleanweather-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The value the synthetic composite holds at a pixel of the full 1 km grid: a ramp,
+    /// with "undetect" (NaN) and "no data" (the fill value) on some columns and rows.
+    fn synthetic(col: usize, row: usize) -> f32 {
+        if col % 97 == 0 {
+            f32::NAN
+        } else if row % 89 == 0 {
+            -9_999_000.0
+        } else {
+            ((col * 7 + row * 13) % 60) as f32
+        }
+    }
+
+    /// A tiled, deflated, two-band float32 GeoTIFF of the full 1 km grid, laid out like
+    /// OPERA's. Only the tiles in `rows × cols` (tile indices) hold the pattern; the rest
+    /// share one constant tile to keep the test fast.
+    fn synthetic_cog(tile_cols: std::ops::RangeInclusive<usize>, tile_rows: std::ops::RangeInclusive<usize>) -> Vec<u8> {
+        use std::io::Write;
+        const T: usize = 512;
+        let (w, h) = (EXTENT_KM.0, EXTENT_KM.1);
+        let (across, down) = (w.div_ceil(T), h.div_ceil(T));
+        let deflate = |f: &dyn Fn(usize, usize) -> f32| {
+            let mut raw = Vec::with_capacity(T * T * 8);
+            for y in 0..T {
+                for x in 0..T {
+                    raw.extend_from_slice(&f(x, y).to_le_bytes());
+                    raw.extend_from_slice(&1.0f32.to_le_bytes()); // quality band
+                }
+            }
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            z.write_all(&raw).unwrap();
+            z.finish().unwrap()
+        };
+        let filler = deflate(&|_, _| f32::NAN);
+        let tiles: Vec<Vec<u8>> = (0..across * down)
+            .map(|i| {
+                let (tx, ty) = (i % across, i / across);
+                if tile_cols.contains(&tx) && tile_rows.contains(&ty) { deflate(&|x, y| synthetic(tx * T + x, ty * T + y)) } else { Vec::new() }
+            })
+            .collect();
+        // Header, one directory of 12 entries, then the offset and length arrays, then data.
+        let n = across * down;
+        let entries: [(u16, u16, u32); 12] = [(256, 4, w as u32), (257, 4, h as u32), (258, 3, 32), (259, 3, 8), (277, 3, 2), (284, 3, 1), (317, 3, 1), (322, 3, 512), (323, 3, 512), (324, 4, 0), (325, 4, 0), (339, 3, 3)];
+        let ifd = 8usize;
+        let offsets_at = ifd + 2 + 12 * entries.len() + 4;
+        let lengths_at = offsets_at + 4 * n;
+        let mut data_at = lengths_at + 4 * n;
+        let filler_at = data_at;
+        data_at += filler.len();
+        let (mut offsets, mut lengths) = (Vec::new(), Vec::new());
+        for t in &tiles {
+            if t.is_empty() {
+                offsets.push(filler_at as u32);
+                lengths.push(filler.len() as u32);
+            } else {
+                offsets.push(data_at as u32);
+                lengths.push(t.len() as u32);
+                data_at += t.len();
+            }
+        }
+        let mut b = vec![0x49, 0x49, 0x2a, 0x00];
+        b.extend_from_slice(&(ifd as u32).to_le_bytes());
+        b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, ty, v) in entries {
+            let (count, value) = match tag {
+                324 => (n as u32, offsets_at as u32),
+                325 => (n as u32, lengths_at as u32),
+                _ => (1, v),
+            };
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // no further directories
+        offsets.iter().chain(&lengths).for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+        b.extend_from_slice(&filler);
+        tiles.iter().for_each(|t| b.extend_from_slice(t));
+        b
+    }
+
+    #[test]
+    fn decodes_a_crop_of_the_composite() {
+        let crop = crop_for(52.37, 4.89, Product::MaxReflectivity).unwrap();
+        let full = grid(Product::MaxReflectivity);
+        let (c, r) = full.to_pixel(crop.to_latlon(0.5, 0.5).0, crop.to_latlon(0.5, 0.5).1);
+        let (c0, r0) = ((c - 0.5).round() as usize, (r - 0.5).round() as usize);
+        let cog = synthetic_cog(c0 / 512..=(c0 + crop.width - 1) / 512, r0 / 512..=(r0 + crop.height - 1) / 512);
+        let cache = temp_cache("decode");
+        let opera = Opera::new(None, cache.clone());
+        let t = time_from_key("OPERA@20261119T1955@0@DBZH").unwrap();
+        let f = opera.frame(&serve(cog), t, &crop).unwrap();
+        assert_eq!((f.time, f.dbz.len()), (t, crop.width * crop.height));
+        for row in 0..crop.height {
+            for col in 0..crop.width {
+                let v = synthetic(c0 + col, r0 + row);
+                let want = if v.is_nan() { -32.0 } else if v <= NODATA { f32::NAN } else { v };
+                let got = f.get(col, row);
+                assert!(got == want || (got.is_nan() && want.is_nan()), "pixel ({col}, {row}): {got}, want {want}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[test]
+    fn a_response_that_is_not_a_tiff_is_an_error() {
+        // A captive portal, a proxy error page or a changed format must give an error,
+        // not a panic (or a request for the whole file).
+        let crop = crop_for(52.37, 4.89, Product::MaxReflectivity).unwrap();
+        let cache = temp_cache("not-tiff");
+        let opera = Opera::new(None, cache.clone());
+        let t = time_from_key("OPERA@20261119T1955@0@DBZH").unwrap();
+        let r = opera.frame(&serve(b"<html>Please log in to the Wi-Fi</html>".to_vec()), t, &crop);
+        let e = format!("{:#}", r.err().unwrap());
+        assert!(e.contains("not a GeoTIFF"), "{e}");
+        let _ = std::fs::remove_dir_all(cache);
     }
 }

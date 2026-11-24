@@ -227,9 +227,7 @@ fn compare_with(product: Product) -> Result<()> {
             }
         }
     }
-    rates.sort_by(|a, b| a.total_cmp(b));
-    let area_k = wet_k as f64 / both as f64;
-    let t_o = rates[((1.0 - area_k) * rates.len() as f64) as usize].max(0.1);
+    let t_o = same_area_threshold(&mut rates, wet_k as f64 / both as f64);
     let mut best = (0.0, 0.0, 0.0);
     for dy in -6..=6 {
         for dx in -6..=6 {
@@ -243,6 +241,16 @@ fn compare_with(product: Product) -> Result<()> {
     println!("same-area threshold for OPERA: {t_o:.1} mm/h");
     println!("CSI: {at0:.3} unshifted, best {:.3} with OPERA shifted {:+} km east, {:+} km south", best.0, best.1, best.2);
     Ok(())
+}
+
+/// The rain rate (at least 0.1 mm/h) above which `rates` cover the share `area` of the
+/// pixels: the threshold that gives one radar the same rain area as another.
+fn same_area_threshold(rates: &mut [f32], area: f64) -> f32 {
+    rates.sort_by(|a, b| a.total_cmp(b));
+    // With no rain area (a dry day) the index would be one past the end; NaN (no pixels
+    // in common) casts to 0.
+    let i = ((1.0 - area) * rates.len() as f64) as usize;
+    rates.get(i.min(rates.len().saturating_sub(1))).copied().unwrap_or(0.0).max(0.1)
 }
 
 /// Agreement (CSI at `threshold` mm/h) between two scans, with the second shifted by
@@ -459,4 +467,25 @@ fn gauges() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_area_threshold_matches_the_area() {
+        let mut rates: Vec<f32> = (0..100).map(|i| i as f32 / 10.0).collect();
+        // The top 20% of these rates are at or above 8 mm/h.
+        assert_eq!(same_area_threshold(&mut rates, 0.2), 8.0);
+    }
+
+    #[test]
+    fn same_area_threshold_on_a_dry_day() {
+        // `rain compare` when KNMI sees no rain anywhere (area 0), or when the two radars
+        // have no pixels in common (no rates, area NaN), must not panic.
+        let mut rates = vec![0.0f32; 50];
+        assert!(same_area_threshold(&mut rates, 0.0) >= 0.1);
+        assert!(same_area_threshold(&mut [], f64::NAN) >= 0.1);
+    }
 }

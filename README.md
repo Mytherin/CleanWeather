@@ -34,7 +34,7 @@ A source is passed over when:
 - it has no data at the location, or
 - it has fewer than two scans.
 
-The next source is used instead. The app's status bar shows which source is in use and, on hover, why another one was skipped. A failed source is tried again after 5 minutes.
+The next source is used instead. The app's status bar shows which source is in use and, on hover, why another one was skipped. A failed source is tried again after 5 minutes, or as soon as the location moves.
 
 **The map** shows rain across Europe from OPERA's 4 km overview of each scan (~290 KB, extrapolated like the local forecast). The location's own radar is drawn on top at 1 km. Within the Netherlands that's KNMI, and OPERA is hidden where KNMI has data.
 
